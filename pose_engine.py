@@ -1,387 +1,306 @@
-"""Multi-person YOLO11 Pose + ByteTrack with a conservative collapse rule."""
+"""Mesin deteksi jatuh berbasis VideoMAE (Hugging Face).
+
+Pengganti pose_engine lama. Antarmuka (ROOT dan process_source) sengaja dibuat
+sama persis dengan yang dipakai app.py, jadi UI tidak perlu diubah.
+
+Catatan: VideoMAE mengklasifikasi seluruh adegan (bukan per orang), jadi tidak
+ada kerangka tubuh maupun ID orang. Lihat keterangan di bagian stats di bawah.
+"""
 from __future__ import annotations
 
+import collections
 import csv
-from dataclasses import dataclass
-from datetime import datetime, timezone
-import hashlib
-import importlib.metadata
 import json
-import math
-import os
-from pathlib import Path
 import threading
 import time
-from uuid import uuid4
-
-ROOT = Path(__file__).resolve().parent
-os.environ.setdefault("YOLO_CONFIG_DIR", str(ROOT / ".cache" / "ultralytics"))
-os.environ.setdefault("YOLO_AUTOINSTALL", "false")
+from datetime import datetime
+from pathlib import Path
 
 import cv2
-import numpy as np
 import torch
-from ultralytics import YOLO
+from PIL import Image
+from transformers import AutoImageProcessor, AutoModelForVideoClassification
 
-from fall_rules import CollapseDetector
+ROOT = Path(__file__).resolve().parent
 
-DEFAULT_MODEL = ROOT / "models" / "yolo11n-pose.pt"
-TRACKER_PATH = ROOT / "tracker.yaml"
-LANDMARK_NAMES = (
-    "nose left_eye right_eye left_ear right_ear left_shoulder right_shoulder "
-    "left_elbow right_elbow left_wrist right_wrist left_hip right_hip "
-    "left_knee right_knee left_ankle right_ankle"
-).split()
-CONNECTIONS = ((0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9),
-               (6, 8), (8, 10), (5, 11), (6, 12), (11, 12), (11, 13),
-               (13, 15), (12, 14), (14, 16))
-CSV_FIELDS = ["frame_index", "timestamp_ms", "track_id", "segment_id", "observed",
-              "track_status", "pose_usable", "landmark_index", "landmark_name",
-              "x", "y", "confidence", "keypoint_valid", "bbox_x1", "bbox_y1",
-              "bbox_x2", "bbox_y2", "detection_confidence"]
-FRAME_FIELDS = ["frame_index", "timestamp_ms", "width", "height", "detections",
-                "tracked_people", "unassigned_people", "usable_poses", "missing_tracks"]
-DETECTION_FIELDS = ["frame_index", "timestamp_ms", "track_id", "bbox_x1", "bbox_y1",
-                    "bbox_x2", "bbox_y2", "detection_confidence"]
-ALERT_FIELDS = ["frame_index", "timestamp_ms", "track_id", "event", "evidence_source", "drop_body_ratio",
-                "descent_ms", "horizontal_hold_ms", "evidence_ms", "bbox_aspect",
-                "floor_rise_body_ratio"]
+# --- Pengaturan -------------------------------------------------------------
+MODEL_NAME = "yadvender12/videomae-base-finetuned-kinetics-finetuned-fall-detect"
+FALL_THRESHOLD = 0.75        # sama seperti script awal: confidence kelas jatuh harus > 75%
+CONFIRM_WINDOWS = 2          # alarm baru bunyi jika N analisis berturut-turut bilang jatuh
+ALERT_COOLDOWN_S = 10.0      # jeda minimal antar alarm (detik)
+SAMPLES_PER_SECOND = 7.5     # 30 fps -> ambil 1 dari 4 frame (jarak sampling bawaan VideoMAE Kinetics)
+INFER_EVERY_SAMPLES = 2      # analisis ulang tiap N sampel baru (30 fps: sekitar 0,27 detik)
+SHORT_EDGE = 224             # sisi terpendek gambar yang masuk ke model
+
+# Warna BGR untuk overlay
+YELLOW, GREEN, RED, ORANGE = (0, 255, 255), (0, 200, 0), (0, 0, 255), (0, 165, 255)
+
+_cache: dict = {}
+_cache_lock = threading.Lock()
 
 
-@dataclass
-class Person:
-    track_id: int | None
-    bbox: tuple
-    score: float
-    points: np.ndarray
+def load_model():
+    """Muat model sekali saja; pemanggilan berikutnya langsung memakai cache."""
+    with _cache_lock:
+        if not _cache:
+            print("Memuat model VideoMAE...")
+            processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
+            model = AutoModelForVideoClassification.from_pretrained(MODEL_NAME)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model.to(device)
+            model.eval()
+            _cache.update(processor=processor, model=model, device=device)
+        return _cache["processor"], _cache["model"], _cache["device"]
 
 
-@dataclass
-class TrackFrame:
-    track_id: int
-    segment_id: int
-    person: Person | None
-    pose_usable: bool
-
-    @property
-    def status(self):
-        if self.person is None:
-            return "temporarily_missing"
-        return "tracked" if self.pose_usable else "insufficient_pose"
+def fall_class_ids(model) -> set[int]:
+    ids = {int(i) for i, name in model.config.id2label.items() if "fall" in str(name).lower()}
+    if not ids:
+        labels = ", ".join(str(v) for v in model.config.id2label.values())
+        raise RuntimeError(f"Model tidak punya kelas 'fall'. Kelas yang ada: {labels}")
+    return ids
 
 
-def valid_points(points, width, height, threshold=0.3):
-    return (np.isfinite(points).all(axis=1) & (points[:, 2] >= threshold)
-            & (points[:, 0] >= 0) & (points[:, 0] < width)
-            & (points[:, 1] >= 0) & (points[:, 1] < height))
+def _predict(frames, processor, model, device, fall_ids):
+    """16 frame PIL -> (label, confidence, apakah_jatuh)."""
+    inputs = processor(list(frames), return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.inference_mode():
+        probs = torch.softmax(model(**inputs).logits, dim=-1)[0]
+    idx = int(probs.argmax())
+    conf = float(probs[idx])
+    return model.config.id2label[idx], conf, (idx in fall_ids and conf > FALL_THRESHOLD)
 
 
-class TrackRegistry:
-    """Keep short missing observations explicit and split sequences at gaps.
+def _to_pil(frame_bgr):
+    """BGR OpenCV -> PIL RGB, dikecilkan dulu supaya buffer 16 frame tidak boros memori."""
+    h, w = frame_bgr.shape[:2]
+    scale = SHORT_EDGE / min(h, w)
+    if scale < 1:
+        frame_bgr = cv2.resize(frame_bgr, (round(w * scale), round(h * scale)),
+                               interpolation=cv2.INTER_AREA)
+    return Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
 
-    A ByteTrack ID is temporary. Segment IDs prevent training clips from silently
-    crossing missing/low-quality poses; they do not repair identity switches.
+
+def _draw_overlay(frame, text, color, alarm):
+    h, w = frame.shape[:2]
+    scale = max(0.6, min(h, w) / 720)
+    thick = max(2, int(round(scale * 2)))
+    if alarm:
+        cv2.rectangle(frame, (0, 0), (w - 1, h - 1), RED, max(4, int(6 * scale)))
+    pos = (20, int(50 * scale))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(frame, text, pos, font, scale, (0, 0, 0), thick + 3, cv2.LINE_AA)
+    cv2.putText(frame, text, pos, font, scale, color, thick, cv2.LINE_AA)
+
+
+class _LatestFrame:
+    """Baca webcam di thread terpisah dan selalu simpan gambar terbaru.
+
+    Tanpa ini, saat model sedang menghitung, gambar webcam menumpuk di buffer
+    dan tampilan jadi tertinggal beberapa detik.
     """
-    def __init__(self, missing_grace_ms=1000):
-        self.missing_grace_ms = missing_grace_ms
-        self.active = {}
-        self.segments = {}
-        self.totals = {}
 
-    def update(self, people, timestamp_ms, width, height):
-        seen = set()
-        records = []
-        for person in people:
-            track_id = person.track_id
-            if track_id is None or track_id in seen:
-                continue
-            seen.add(track_id)
-            mask = valid_points(person.points, width, height)
-            usable = bool(mask.sum() >= 6 and mask[[5, 6, 11, 12]].sum() >= 2)
-            state = self.active.get(track_id)
-            if state is None or timestamp_ms - state["last_seen"] > self.missing_grace_ms:
-                segment = self.segments.get(track_id, -1) + 1
-                state = {"last_seen": timestamp_ms, "segment": segment, "gap": False}
-                self.active[track_id] = state
-            elif usable and state["gap"]:
-                state["segment"] += 1
-            self.segments[track_id] = state["segment"]
-            state.update(last_seen=timestamp_ms, gap=not usable)
-            records.append(TrackFrame(track_id, state["segment"], person, usable))
-            total = self.totals.setdefault(track_id, {"first_seen_ms": timestamp_ms,
-                                                     "observed_frames": 0, "usable_pose_frames": 0})
-            total["last_seen_ms"] = timestamp_ms
-            total["observed_frames"] += 1
-            total["usable_pose_frames"] += int(usable)
-            total["segments"] = state["segment"] + 1
-        for track_id, state in list(self.active.items()):
-            if track_id in seen:
-                continue
-            state["gap"] = True
-            if timestamp_ms - state["last_seen"] <= self.missing_grace_ms:
-                records.append(TrackFrame(track_id, state["segment"], None, False))
-            else:
-                del self.active[track_id]
-        return sorted(records, key=lambda record: record.track_id)
+    def __init__(self, cap):
+        self.cap = cap
+        self.cond = threading.Condition()
+        self.frame = None
+        self.seq = 0
+        self.alive = True
+        self.closed = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="camera-reader", daemon=True)
+        self.thread.start()
 
-
-def parse_result(result):
-    boxes = result.boxes
-    if boxes is None or len(boxes) == 0:
-        return []
-    if result.keypoints is None or result.keypoints.conf is None:
-        raise RuntimeError("Model harus menghasilkan 17 titik tubuh dan skor confidence.")
-    coordinates = result.keypoints.xy.cpu().numpy()
-    confidence = result.keypoints.conf.cpu().numpy()
-    if coordinates.shape[1:] != (17, 2):
-        raise RuntimeError("Prototipe ini menggunakan susunan 17 titik COCO YOLO Pose.")
-    ids = boxes.id.cpu().numpy() if boxes.is_track and boxes.id is not None else [None] * len(boxes)
-    return [Person(int(identity) if identity is not None else None, tuple(box), float(score),
-                   np.column_stack((xy, conf)))
-            for identity, box, score, xy, conf in zip(
-                ids, boxes.xyxy.cpu().numpy(), boxes.conf.cpu().numpy(), coordinates, confidence)]
-
-
-def landmark_rows(frame_index, timestamp_ms, record, width, height):
-    person = record.person
-    mask = valid_points(person.points, width, height) if person else np.zeros(17, dtype=bool)
-    for index, name in enumerate(LANDMARK_NAMES):
-        row = dict.fromkeys(CSV_FIELDS, "")
-        row.update(frame_index=frame_index, timestamp_ms=timestamp_ms, track_id=record.track_id,
-                   segment_id=record.segment_id, observed=int(person is not None),
-                   track_status=record.status, pose_usable=int(record.pose_usable),
-                   landmark_index=index, landmark_name=name, keypoint_valid=int(mask[index]))
-        if person:
-            x, y, score = map(float, person.points[index])
-            if math.isfinite(score):
-                row["confidence"] = score
-            # Zero-confidence coordinates can be placeholders from the model.
-            if score > 0 and math.isfinite(x) and math.isfinite(y):
-                row.update(x=x / width, y=y / height)
-            row.update(bbox_x1=float(person.bbox[0]) / width, bbox_y1=float(person.bbox[1]) / height,
-                       bbox_x2=float(person.bbox[2]) / width, bbox_y2=float(person.bbox[3]) / height,
-                       detection_confidence=person.score)
-        yield row
-
-
-PALETTE = ((80, 210, 255), (100, 240, 110), (240, 170, 80), (190, 100, 240),
-           (80, 180, 250), (240, 210, 80), (220, 120, 150))
-
-
-def draw_people(frame, people, fall_statuses=None, provisional_matches=None):
-    height, width = frame.shape[:2]
-    fall_statuses = fall_statuses or {}
-    provisional_matches = provisional_matches or {}
-    tracked = 0
-    for person in people:
-        identity = person.track_id
-        tracked += identity is not None
-        display_identity = identity if identity is not None else provisional_matches.get(id(person))
-        fall_status = fall_statuses.get(display_identity, "normal")
-        color = ((0, 0, 255) if fall_status == "alert" else
-                 (0, 190, 255) if fall_status == "candidate" else
-                 PALETTE[identity % len(PALETTE)] if identity is not None else (155, 155, 155))
-        x1, y1, x2, y2 = (int(v) for v in person.bbox)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3 if fall_status == "alert" else 2)
-        mask = valid_points(person.points, width, height)
-        positions = {i: (int(p[0]), int(p[1])) for i, p in enumerate(person.points) if mask[i]}
-        for start, end in CONNECTIONS:
-            if start in positions and end in positions:
-                cv2.line(frame, positions[start], positions[end], color, 2, cv2.LINE_AA)
-        for position in positions.values():
-            cv2.circle(frame, position, 3, color, -1, cv2.LINE_AA)
-        label = (f"ID {display_identity}* | PERIKSA: DIDUGA JATUH" if fall_status == "alert" and identity is None else
-                 f"ID {display_identity} | PERIKSA: DIDUGA JATUH" if fall_status == "alert" else
-                 f"ID {display_identity}* | memeriksa gerakan" if fall_status == "candidate" and identity is None else
-                 f"ID {display_identity} | memeriksa gerakan" if fall_status == "candidate" else
-                 f"ID {identity} | {int(mask.sum())}/17 titik" if identity is not None else "Menunggu ID")
-        text_y = min(height - 8, max(58, y1 - 8))
-        cv2.putText(frame, label, (max(0, x1), text_y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(frame, label, (max(0, x1), text_y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55, color, 1, cv2.LINE_AA)
-    active_alerts = [identity for identity, status in fall_statuses.items() if status == "alert"]
-    cv2.rectangle(frame, (0, 0), (width, min(height, 40)), (0, 0, 145) if active_alerts else (30, 35, 28), -1)
-    banner = (f"ALARM - periksa ID {', '.join(map(str, active_alerts))}" if active_alerts else
-              f"{tracked} orang dengan ID | {len(people) - tracked} menunggu ID")
-    cv2.putText(frame, banner,
-                (10, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 245, 240), 1, cv2.LINE_AA)
-    return frame
-
-
-def process_source(source, output_root=ROOT / "outputs", model_path=DEFAULT_MODEL,
-                   save_video=True, stop=None, on_frame=None, realtime=False,
-                   max_frames=None, max_people=10, image_size=640, device="cpu"):
-    stop = stop if stop is not None else threading.Event()
-    if not isinstance(max_people, int) or not 1 <= max_people <= 100:
-        raise ValueError("Batas orang harus antara 1 dan 100.")
-    model_path = Path(model_path)
-    if not model_path.is_file():
-        raise FileNotFoundError("Model YOLO belum tersedia. Jalankan MULAI.cmd terlebih dahulu.")
-    camera = isinstance(source, int)
-    if not camera and not Path(source).is_file():
-        raise FileNotFoundError(f"Video tidak ditemukan: {source}")
-    capture = cv2.VideoCapture(source if camera else str(source))
-    if not capture.isOpened():
-        capture.release()
-        raise RuntimeError("Sumber tidak bisa dibuka. Periksa video atau izin webcam Windows.")
-    fps = capture.get(cv2.CAP_PROP_FPS)
-    fallback_fps = not math.isfinite(fps) or not 1 <= fps <= 240
-    if fallback_fps:
-        fps = 30.0
-    count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
-    total_frames = max(0, int(count)) if not camera and math.isfinite(count) else 0
-    session = Path(output_root) / (datetime.now().strftime("%Y%m%d_%H%M%S") + "_yolo_" + uuid4().hex[:6])
-    try:
-        (session / "tracks").mkdir(parents=True, exist_ok=False)
-    except OSError:
-        capture.release()
-        raise
-    registry = TrackRegistry()
-    collapse = CollapseDetector()
-    summary = {
-        "schema_version": 2, "source": f"webcam:{source}" if camera else str(Path(source).resolve()),
-        "started_at": datetime.now(timezone.utc).isoformat(), "status": "processing",
-        "backend": "YOLO11-Pose + ByteTrack", "ultralytics_version": importlib.metadata.version("ultralytics"),
-        "torch_version": torch.__version__, "model": model_path.name,
-        "model_sha256": hashlib.sha256(model_path.read_bytes()).hexdigest(),
-        "tracker": "tracker.yaml", "tracker_sha256": hashlib.sha256(TRACKER_PATH.read_bytes()).hexdigest(),
-        "device": device, "image_size": image_size, "source_fps": fps, "fps_fallback": fallback_fps,
-        "source_frame_count": total_frames, "max_people": max_people, "keypoints_per_person": 17,
-        "frames_processed": 0, "frames_with_pose": 0, "max_simultaneous_tracked": 0,
-        "annotated_video": None, "csv": "landmarks.csv", "frame_csv": "frames.csv",
-        "track_directory": "tracks", "detection_csv": "detections.csv",
-        "fall_classifier": "rule_based_collapse_v1",
-        "collapse_rule": collapse.settings(), "alerts_csv": "alerts.csv", "alerts_count": 0,
-    }
-    writer = None
-    processed = detected_frames = 0
-    inference_seconds = 0.0
-    last_timestamp = -1
-    first_frame_wall = None
-    last_frame = None
-    run_start = time.perf_counter()
-    try:
-        torch.set_num_threads(min(4, os.cpu_count() or 1))
-        # A fresh model/tracker per source prevents cross-session histories.
-        model = YOLO(str(model_path), task="pose")
-        with (session / "landmarks.csv").open("w", newline="", encoding="utf-8") as landmark_file, \
-                (session / "frames.csv").open("w", newline="", encoding="utf-8") as frame_file, \
-                (session / "detections.csv").open("w", newline="", encoding="utf-8") as detection_file, \
-                (session / "alerts.csv").open("w", newline="", encoding="utf-8") as alert_file:
-            landmark_writer = csv.DictWriter(landmark_file, fieldnames=CSV_FIELDS)
-            landmark_writer.writeheader()
-            frame_writer = csv.DictWriter(frame_file, fieldnames=FRAME_FIELDS)
-            frame_writer.writeheader()
-            detection_writer = csv.DictWriter(detection_file, fieldnames=DETECTION_FIELDS)
-            detection_writer.writeheader()
-            alert_writer = csv.DictWriter(alert_file, fieldnames=ALERT_FIELDS)
-            alert_writer.writeheader()
-            while not stop.is_set():
-                ok, frame = capture.read()
+    def _run(self):
+        while not self.closed.is_set():
+            ok, frame = self.cap.read()
+            with self.cond:
                 if not ok:
-                    if camera:
-                        raise RuntimeError("Aliran webcam terputus. Data sebelumnya tetap disimpan.")
+                    self.alive = False
+                    self.cond.notify_all()
+                    return
+                self.frame = frame
+                self.seq += 1
+                self.cond.notify_all()
+
+    def read(self, last_seq, timeout=0.5):
+        """(ok, frame, seq). frame=None berarti belum ada gambar baru (timeout)."""
+        with self.cond:
+            self.cond.wait_for(lambda: self.seq != last_seq or not self.alive, timeout)
+            if self.seq != last_seq:
+                return True, self.frame, self.seq
+            return self.alive, None, last_seq
+
+    def close(self):
+        self.closed.set()
+        self.thread.join(timeout=2)
+
+
+def process_source(source, save_video=True, stop=None, on_frame=None, realtime=True, max_people=10):
+    """Proses video (Path) atau webcam (int). Mengembalikan (folder_hasil, ringkasan).
+
+    Parameter realtime dan max_people dipertahankan agar cocok dengan app.py,
+    tetapi tidak dipakai: VideoMAE tidak melacak orang satu per satu.
+
+    Isi stats yang dikirim ke on_frame (sesuai yang dibaca app.py):
+      people / usable_poses -> selalu 0 (tidak ada deteksi per orang)
+      new_alerts            -> track_id di sini adalah nomor kejadian jatuh (1, 2, 3, ...)
+    """
+    stop = stop or threading.Event()
+    is_camera = isinstance(source, int)
+    processor, model, device = load_model()
+    fall_ids = fall_class_ids(model)
+    num_frames = int(getattr(model.config, "num_frames", 16))
+
+    cap = cv2.VideoCapture(source if is_camera else str(source))
+    if not cap.isOpened():
+        cap.release()
+        raise RuntimeError(f"Tidak bisa membuka webcam nomor {source}." if is_camera
+                           else f"Tidak bisa membuka video: {source}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0
+    if not 1 <= fps <= 240:
+        fps = 30.0
+    total_frames = 0 if is_camera else max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+    name = f"webcam{source}" if is_camera else Path(source).stem
+    base = ROOT / "outputs" / f"{datetime.now():%Y%m%d_%H%M%S}_{name}"
+    out_dir, suffix = base, 1
+    while out_dir.exists():  # dua sesi dalam detik yang sama tidak boleh saling menimpa
+        suffix += 1
+        out_dir = base.with_name(f"{base.name}_{suffix}")
+    out_dir.mkdir(parents=True)
+
+    reader = _LatestFrame(cap) if is_camera else None
+    pred_file = open(out_dir / "predictions.csv", "w", newline="", encoding="utf-8")
+    alert_file = open(out_dir / "alerts.csv", "w", newline="", encoding="utf-8")
+    pred_csv, alert_csv = csv.writer(pred_file), csv.writer(alert_file)
+    pred_csv.writerow(["frame", "timestamp_ms", "label", "confidence", "is_fall", "fall_streak"])
+    alert_csv.writerow(["alert_id", "frame", "timestamp_ms", "label", "confidence"])
+    writer = None
+    warning = None
+
+    window = collections.deque(maxlen=num_frames)
+    interval = 1.0 / SAMPLES_PER_SECOND
+    next_sample = 0.0
+    since_infer = 0
+    status_text, status_color, label = "Analyzing...", YELLOW, ""
+    fall_streak = 0
+    last_alert_ts = float("-inf")
+    alerts_count = 0
+    frame_no = 0
+    seq = 0
+    n_infer, infer_time = 0, 0.0
+    fps_ema, last_tick = 0.0, None
+    t0 = time.monotonic()
+
+    try:
+        while not stop.is_set():
+            if reader:
+                ok, frame, seq = reader.read(seq)
+                if not ok:
+                    warning = "Webcam berhenti mengirim gambar."
                     break
-                if first_frame_wall is None:
-                    first_frame_wall = time.perf_counter()
-                if camera:
-                    raw_timestamp = (time.perf_counter() - first_frame_wall) * 1000
-                else:
-                    raw_timestamp = capture.get(cv2.CAP_PROP_POS_MSEC)
-                    if not math.isfinite(raw_timestamp) or (processed > 0 and raw_timestamp <= last_timestamp):
-                        raw_timestamp = processed * 1000 / fps
-                timestamp = max(last_timestamp + 1, round(raw_timestamp))
-                last_timestamp = timestamp
-                height, width = frame.shape[:2]
-                inference_start = time.perf_counter()
-                result = model.track(frame, persist=True, tracker=str(TRACKER_PATH),
-                                     conf=0.15, iou=0.5, imgsz=image_size,
-                                     max_det=max_people, classes=[0], device=device, verbose=False)[0]
-                people = parse_result(result)
-                for person in people:
-                    detection_writer.writerow(dict(
-                        frame_index=processed, timestamp_ms=timestamp,
-                        track_id=person.track_id if person.track_id is not None else "",
-                        bbox_x1=float(person.bbox[0]) / width,
-                        bbox_y1=float(person.bbox[1]) / height,
-                        bbox_x2=float(person.bbox[2]) / width,
-                        bbox_y2=float(person.bbox[3]) / height,
-                        detection_confidence=person.score))
-                inference_seconds += time.perf_counter() - inference_start
-                records = registry.update(people, timestamp, width, height)
-                fall_statuses, new_alerts = collapse.update(
-                    records, timestamp, width, height, processed,
-                    unassigned_people=[person for person in people if person.track_id is None])
-                if new_alerts:
-                    alert_writer.writerows(new_alerts)
-                    alert_file.flush()
-                    summary["alerts_count"] += len(new_alerts)
-                tracked = sum(person.track_id is not None for person in people)
-                usable = sum(record.pose_usable for record in records)
-                missing = sum(record.person is None for record in records)
-                for record in records:
-                    rows = list(landmark_rows(processed, timestamp, record, width, height))
-                    landmark_writer.writerows(rows)
-                    track_path = session / "tracks" / f"track_{record.track_id:04d}.csv"
-                    exists = track_path.exists()
-                    with track_path.open("a", newline="", encoding="utf-8") as track_file:
-                        per_track = csv.DictWriter(track_file, fieldnames=CSV_FIELDS)
-                        if not exists:
-                            per_track.writeheader()
-                        per_track.writerows(rows)
-                frame_writer.writerow(dict(frame_index=processed, timestamp_ms=timestamp, width=width,
-                                           height=height, detections=len(people), tracked_people=tracked,
-                                           unassigned_people=len(people) - tracked,
-                                           usable_poses=usable, missing_tracks=missing))
-                summary["max_simultaneous_tracked"] = max(summary["max_simultaneous_tracked"], tracked)
-                detected_frames += usable > 0
-                annotated = draw_people(frame, people, fall_statuses, collapse.provisional_matches)
-                if save_video and not camera:
-                    if writer is None:
-                        writer = cv2.VideoWriter(str(session / "annotated.mp4"),
-                                                 cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-                        if not writer.isOpened():
-                            raise RuntimeError("Video keluaran gagal dibuat. Matikan opsi simpan video dan coba lagi.")
-                        summary["annotated_video"] = "annotated.mp4"
-                    writer.write(annotated)
-                processed += 1
-                last_frame = annotated
-                if on_frame:
-                    on_frame(annotated, dict(frame=processed, total_frames=total_frames,
-                                             timestamp_ms=timestamp, people=tracked, usable_poses=usable,
-                                             unassigned=len(people) - tracked, missing_tracks=missing,
-                                             total_ids=len(registry.totals),
-                                             active_alert_ids=[identity for identity, status in fall_statuses.items()
-                                                               if status == "alert"],
-                                             new_alerts=new_alerts, alerts_count=summary["alerts_count"],
-                                             inference_fps=processed / max(inference_seconds, 1e-9)))
-                if max_frames is not None and processed >= max_frames:
-                    summary["status"] = "limited"
+                if frame is None:
+                    continue
+                ts = time.monotonic() - t0
+            else:
+                ok, frame = cap.read()
+                if not ok:
                     break
-                if realtime and not camera:
-                    stop.wait(max(0, processed / fps - (time.perf_counter() - first_frame_wall)))
-            if not processed and not stop.is_set():
-                raise RuntimeError("Tidak ada frame yang bisa dibaca dari video.")
-        if summary["status"] == "processing":
-            summary["status"] = "stopped" if stop.is_set() else "completed"
-    except Exception as error:
-        summary.update(status="failed", error=str(error))
-        raise
+                ts = frame_no / fps
+            frame_no += 1
+
+            new_alerts = []
+            if ts + 1e-6 >= next_sample:
+                next_sample += interval
+                if next_sample < ts:
+                    next_sample = ts + interval
+                window.append(_to_pil(frame))
+                since_infer += 1
+                if len(window) == num_frames and since_infer >= INFER_EVERY_SAMPLES:
+                    since_infer = 0
+                    started = time.monotonic()
+                    label, conf, is_fall = _predict(window, processor, model, device, fall_ids)
+                    infer_time += time.monotonic() - started
+                    n_infer += 1
+                    fall_streak = fall_streak + 1 if is_fall else 0
+
+                    if is_fall:
+                        status_text = f"WARNING: FALL DETECTED ({conf * 100:.1f}%)"
+                        status_color = RED
+                    elif "fall" in label.lower():
+                        status_text = f"Checking - {label} ({conf * 100:.1f}%)"
+                        status_color = ORANGE
+                    else:
+                        status_text = f"Normal - {label} ({conf * 100:.1f}%)"
+                        status_color = GREEN
+
+                    pred_csv.writerow([frame_no, int(ts * 1000), label, f"{conf:.4f}",
+                                       int(is_fall), fall_streak])
+                    pred_file.flush()
+
+                    # Alarm hanya saat streak baru mencapai batas (bukan terus-menerus
+                    # selama orang masih terbaring) dan di luar masa jeda.
+                    if fall_streak == CONFIRM_WINDOWS and ts - last_alert_ts >= ALERT_COOLDOWN_S:
+                        alerts_count += 1
+                        last_alert_ts = ts
+                        new_alerts.append({"track_id": alerts_count, "timestamp_ms": int(ts * 1000),
+                                           "label": label, "confidence": conf})
+                        alert_csv.writerow([alerts_count, frame_no, int(ts * 1000), label, f"{conf:.4f}"])
+                        alert_file.flush()
+
+            _draw_overlay(frame, status_text, status_color, fall_streak >= CONFIRM_WINDOWS)
+
+            if save_video and not is_camera:
+                if writer is None:
+                    h, w = frame.shape[:2]
+                    writer = cv2.VideoWriter(str(out_dir / "annotated.mp4"),
+                                             cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+                    if not writer.isOpened():
+                        warning = "Video hasil tidak bisa disimpan (codec mp4v tidak tersedia)."
+                if writer.isOpened():
+                    writer.write(frame)
+
+            now = time.monotonic()
+            if last_tick is not None and now > last_tick:
+                inst = 1.0 / (now - last_tick)
+                fps_ema = inst if fps_ema == 0 else 0.9 * fps_ema + 0.1 * inst
+            last_tick = now
+
+            if on_frame:
+                on_frame(frame, {
+                    "people": 0,
+                    "usable_poses": 0,
+                    "frame": frame_no,
+                    "timestamp_ms": int(ts * 1000),
+                    "alerts_count": alerts_count,
+                    "inference_fps": fps_ema,
+                    "total_frames": total_frames,
+                    "new_alerts": new_alerts,
+                })
     finally:
-        capture.release()
+        if reader:
+            reader.close()
+        cap.release()
         if writer is not None:
             writer.release()
-        if last_frame is not None:
-            cv2.imwrite(str(session / "preview.jpg"), last_frame)
-        summary.update(frames_processed=processed, frames_with_pose=detected_frames,
-                       pose_detection_rate=detected_frames / processed if processed else 0,
-                       last_timestamp_ms=last_timestamp if processed else None,
-                       inference_fps=processed / max(inference_seconds, 1e-9),
-                       processing_fps=processed / max(time.perf_counter() - run_start, 1e-9),
-                       tracks=registry.totals, unique_track_ids=len(registry.totals),
-                       finished_at=datetime.now(timezone.utc).isoformat())
-        if not camera and summary["status"] == "completed" and total_frames > processed + 1:
-            summary["warning"] = "Decoder berhenti lebih awal dari jumlah frame yang dilaporkan."
-        (session / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return session, summary
+        pred_file.close()
+        alert_file.close()
+
+    if warning is None and device.type == "cpu" and n_infer:
+        warning = f"Berjalan di CPU: rata-rata {infer_time / n_infer:.1f} dtk per analisis."
+
+    summary = {
+        "status": "stopped" if stop.is_set() else "completed",
+        "model": MODEL_NAME,
+        "device": str(device),
+        "frames_processed": frame_no,
+        "analyses": n_infer,
+        "alerts_count": alerts_count,
+        "max_simultaneous_tracked": 0,
+        "unique_track_ids": 0,
+        "warning": warning,
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False),
+                                          encoding="utf-8")
+    return out_dir, summary
