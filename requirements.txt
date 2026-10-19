@@ -2,6 +2,6 @@ ultralytics>=8.3,<9
 lap>=0.5.12,<0.6
 opencv-python>=4.10,<5
 Pillow>=10,<13
-torch 
-transformers 
-opencv-python 
+torch==2.5.1
+transformers==5.20.1
+opencv-python>=4.10
