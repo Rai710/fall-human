@@ -1,0 +1,52 @@
+# Lingkungan Python dan cache lokal
+.venv/
+.venv-yolo/
+venv/
+env/
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Bobot model diunduh oleh start.ps1 saat aplikasi dijalankan
+models/
+
+# Video, gambar, dataset, serta hasil pemrosesan lokal
+data/*
+!data/README.md
+outputs/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.csv
+*.parquet
+*.npy
+*.npz
+*.pkl
+*.joblib
+
+# Konfigurasi dan informasi pribadi mesin
+local_python.txt
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*credentials*.json
+*.log
+
+# Salinan kode lama dan file editor
+backup_before_*/
+legacy_mediapipe_*/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
