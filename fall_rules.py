@@ -169,7 +169,7 @@ class CollapseDetector:
         best = None
         for previous in state.history:
             elapsed = current.timestamp_ms - previous.timestamp_ms
-            if not self.MIN_DESCENT_MS <= elapsed <= self.LOOKBACK_MS or not previous.upright:
+            if not self.MIN_DESCENT_MS <= elapsed <= self.LOOKBACK_MS or previous.horizontal:
                 continue
             floor_rise = previous.bbox_bottom - current.bbox_bottom
             if floor_rise > self.MAX_FLOOR_RISE_BODY_RATIO * previous.bbox_height:
