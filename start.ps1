@@ -44,8 +44,8 @@ try {
     $dependenciesReady = $LASTEXITCODE -eq 0
 } catch { }
 if (!$dependenciesReady) {
-    Write-Host 'Menyiapkan paket aplikasi: PyTorch CPU dan VideoMAE...'
-    & $venvPython -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+    Write-Host 'Menyiapkan paket aplikasi: PyTorch CPU/GPU dan VideoMAE...'
+    & $venvPython -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
     if ($LASTEXITCODE -ne 0) { throw 'Pemasangan PyTorch gagal. Periksa koneksi internet.' }
     & $venvPython -m pip install -r (Join-Path $PSScriptRoot 'requirements.txt')
     if ($LASTEXITCODE -ne 0) { throw 'Pemasangan paket gagal. Periksa koneksi internet.' }
