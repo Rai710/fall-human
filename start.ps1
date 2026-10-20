@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
+$env:HF_HUB_CACHE = Join-Path $PSScriptRoot '.cache\huggingface\hub'
 $env:YOLO_CONFIG_DIR = Join-Path $PSScriptRoot '.cache\ultralytics'
 $env:YOLO_AUTOINSTALL = 'false'
 $venvPython = Join-Path $PSScriptRoot '.venv-yolo\Scripts\python.exe'
@@ -39,17 +40,17 @@ if (!(Test-Path -LiteralPath $venvPython)) {
 
 $dependenciesReady = $false
 try {
-    & $venvPython -c 'import torch, torchvision, ultralytics, lap, cv2, PIL' 2>$null
+    & $venvPython -c 'import torch, torchvision, cv2, PIL, huggingface_hub, safetensors, ultralytics, lap; from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification; assert tuple(int(p) for p in torch.__version__.split(chr(43))[0].split(chr(46))[:2]) >= (2, 6)' 2>$null
     $dependenciesReady = $LASTEXITCODE -eq 0
 } catch { }
 if (!$dependenciesReady) {
-    Write-Host 'Mengunduh PyTorch CPU dan YOLO Pose untuk penggunaan pertama...'
+    Write-Host 'Menyiapkan paket aplikasi: PyTorch CPU dan VideoMAE...'
     & $venvPython -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
     if ($LASTEXITCODE -ne 0) { throw 'Pemasangan PyTorch gagal. Periksa koneksi internet.' }
     & $venvPython -m pip install -r (Join-Path $PSScriptRoot 'requirements.txt')
     if ($LASTEXITCODE -ne 0) { throw 'Pemasangan paket gagal. Periksa koneksi internet.' }
 }
-& $venvPython (Join-Path $PSScriptRoot 'download_model.py')
-if ($LASTEXITCODE -ne 0) { throw 'Model tidak berhasil disiapkan.' }
+# Model download is an explicit action (download_model.py or the GUI checkbox).
+# Starting the GUI alone does not download weights or activate any camera.
 & $venvPython (Join-Path $PSScriptRoot 'app.py')
 if ($LASTEXITCODE -ne 0) { throw 'Aplikasi berhenti dengan kesalahan.' }

@@ -1,156 +1,165 @@
-# Prototipe deteksi dugaan orang jatuh — beberapa orang dalam satu kamera
+# Deteksi dugaan orang jatuh — YOLO + ByteTrack + VideoMAE lokal
 
-Proyek deteksi orang jatuh di koridor atau ruang tunggu rumah sakit. Versi ini
-mendeteksi beberapa orang, menggambar **17 titik tubuh per orang**, memberi ID
-sementara melalui **ByteTrack**, dan mengekspor riwayat titik tubuh per ID.
-Model bawaan adalah **YOLO11n-Pose**; tidak ada training pose pada tahap ini.
-Aturan gerak per ID memberi alarm lokal ketika seseorang tampak turun cepat,
-berakhir horizontal dekat pijakan awal, dan tetap demikian selama 1,5 detik.
-
-**Alarm berarti dugaan jatuh, bukan kepastian medis.** Petugas perlu memeriksa
-rekaman/orang tersebut. Pose yang hilang saja tidak dianggap jatuh.
+Backend utama mendeteksi orang dengan YOLO11 Pose, memberi ID sementara lewat
+ByteTrack, lalu menilai klip RGB setiap orang menggunakan VideoMAE. MediaPipe dan
+aturan sudut/kecepatan koordinat tubuh tidak dipakai untuk menentukan jatuh.
 
 ## Menjalankan
 
-Klik dua kali **MULAI.cmd**. Pilih **Pilih & proses video** atau **Mulai webcam**.
-Ubah **Batas orang dalam gambar** jika diperlukan (awal: 10). Batas ini membatasi
-jumlah deteksi, bukan jaminan semua orang terlihat atau terlacak. Tekan **Hentikan**
-untuk menyelesaikan sesi dan **Buka hasil** untuk melihat ekspor.
+1. Klik `MULAI.cmd` di folder proyek.
+2. Biarkan **Analisis per orang (YOLO + ByteTrack)** tercentang.
+3. Biarkan **Simulasi live: ikuti waktu video** tercentang untuk mengukur perilaku
+   yang mendekati sumber langsung. Mode offline menunggu analisis dan tidak
+   boleh dijadikan bukti kecepatan live.
+4. Pilih video CCTV. Setelah file berhasil, webcam atau RTSP bisa dicoba sendiri.
+5. Perhatikan waktu deteksi/tracking, waktu analisis klip, usia hasil, dan antrean.
 
-Jika aturan terpenuhi, kotak ID berubah merah, banner alarm merah muncul, dan
-komputer berbunyi lalu mengulang setiap 4 detik sampai **Tandai ditangani**
-ditekan. Tombol itu menghentikan bunyi di aplikasi; kejadian tetap dicatat.
-Alarm ini hanya tampil/berbunyi di komputer yang menjalankan aplikasi. Belum
-ada pengiriman pesan ke ponsel, nurse station, atau sistem rumah sakit.
+Model lokal yang dibutuhkan:
 
-Pemrosesan berjalan lokal pada CPU. Webcam baru aktif setelah tombol ditekan.
-Python dan paket tersimpan di `.venv-yolo`; lingkungan MediaPipe `.venv` tetap
-tersedia. Paket dan model diunduh pada penggunaan pertama; setelah itu dapat
-dipakai tanpa koneksi internet. Python 3.12 dengan Tcl/Tk disarankan.
+- `models/yolo11n-pose.pt`
+- `models/videomae-fall/config.json`
+- `models/videomae-fall/preprocessor_config.json`
+- `models/videomae-fall/model.safetensors`
 
-Contoh pemrosesan tanpa tampilan:
+Model-model ini sudah ada saat integrasi dibuat. YOLO tidak diunduh otomatis.
+Kotak **Izinkan unduhan model pertama** hanya mengizinkan unduhan VideoMAE.
+Untuk menyiapkan VideoMAE secara terpisah, jalankan `download_model.py`.
+Membuka GUI tidak mengaktifkan kamera. Dependensi yang belum ada dapat dipasang
+launcher; environment lokal tetap bernama `.venv-yolo`.
 
-```powershell
-.\.venv-yolo\Scripts\python.exe extract_pose.py "D:\video\contoh.mp4"
-.\.venv-yolo\Scripts\python.exe extract_pose.py "D:\video\contoh.mp4" --max-people 15 --no-video
-.\.venv-yolo\Scripts\python.exe extract_pose.py "D:\video\contoh.mp4" --image-size 960 --max-frames 60
+## Alur dan pengaturan awal
+
+```text
+Pembaca kamera/file ──> preview terbaru dan perekaman file
+                   └─> YOLO + ByteTrack ──> klip RGB per ID/segmen
+                                           └─> VideoMAE ──> log + alarm
 ```
 
-Ukuran gambar lebih tinggi dapat membantu orang yang tampak kecil, tetapi harus
-diuji terhadap kecepatan. `--device 0` hanya berlaku jika pengguna memasang
-PyTorch dengan dukungan CUDA; pemasangan bawaan proyek ini menggunakan CPU.
+Pembacaan sumber, tracking, dan VideoMAE berjalan pada pekerja terpisah.
+Setiap klip berisi 16 sampel nyata sekitar 2 detik. Ini tidak membatasi kamera
+menjadi 16 FPS. Satu area crop tetap, berupa gabungan kotak orang sepanjang
+klip dengan margin 20%, dipakai untuk semua sampel agar gerakan spasial tidak
+hilang akibat gambar terus dipusatkan ulang. Crop dibuat persegi dengan padding.
+Checkpoint yang semula dicoba pada seluruh kamera belum terbukti akurat pada
+semua crop per orang; evaluasi pada rekaman tujuan tetap diperlukan.
+
+| Pengaturan | Awal | Keterangan |
+| --- | --- | --- |
+| Target deteksi | 10 FPS | Target sampling YOLO, bukan jaminan FPS aktual |
+| Ukuran YOLO | 416 | Model pose lokal tetap dipakai; titik pose tidak menentukan jatuh |
+| Batas analisis orang | 6 | Orang di luar batas ditandai; bukan dianggap aman |
+| Klip | 16 frame / sekitar 2 detik | Sampel hilang tidak diduplikasi |
+| Jeda analisis per orang | 1 detik | Pengajuan kerja, bukan jaminan model selesai dalam 1 detik |
+| Ambang FallDown | 75% | Skor checkpoint, bukan probabilitas klinis terkalibrasi |
+| Konfirmasi awal | 1 hasil | Dugaan awal cepat; dapat dinaikkan menjadi 2 di GUI/CLI |
+| Batas usia hasil live | 3 detik | Hasil lebih tua tidak mengonfirmasi/memulihkan alarm |
+
+Satu hasil sebagai dugaan awal mengurangi waktu menunggu aksi singkat, tetapi
+berisiko lebih banyak alarm palsu. Mengatur konfirmasi 2 menambah penundaan dan
+bisa melewatkan jatuh yang hanya muncul pada satu jendela. Tidak ada pengaturan
+yang sudah divalidasi untuk penggunaan klinis.
+
+VideoMAE memproses satu klip aktif, dengan paling banyak satu klip terbaru
+menunggu per orang. Penggantian klip orang A mempertahankan giliran orang B.
+Klip yang sudah melewati batas usia sebelum mulai dihitung dicatat sebagai
+`SKIPPED_EXPIRED`. Jika kapasitas CPU kurang, kejadian masih bisa terlewat;
+antrean terbatas tidak membuat model menjadi lebih cepat.
+
+## ID, kehilangan deteksi, dan alarm
+
+- ID ByteTrack bersifat sementara, bukan identitas pasien.
+- Celah pengamatan sampai 0,5 detik ditoleransi tanpa menggandakan gambar.
+  Celah lebih panjang memulai segmen baru dan mengosongkan buffer parsial. Klip
+  lengkap yang sudah terbentuk tetap boleh dinilai selama belum kedaluwarsa.
+- Hasil klip nyata yang masih segar dapat memicu dugaan jatuh walaupun orang
+  sudah tidak terdeteksi saat hasil selesai. ID/segmen kejadian tetap memakai
+  ID historis; hasil tidak dipasang pada segmen/orang baru.
+- Kotak tidak menjadi prediksi posisi masa kini. Jika tracking terlambat,
+  tampilannya ditandai **TRACKING LAMA**.
+- Satu kejadian dikunci sampai ada dua hasil normal berturut-turut. `LyingDown`
+  sendiri tidak memicu alarm baru. Pergantian ID masih dapat memicu duplikasi.
+- Banner dan bunyi pengingat tetap aktif sampai **Tandai ditangani** ditekan.
+  Tombol ini tidak menghapus riwayat atau mengubah keputusan model.
+
+Deteksi yang hilang saat tubuh berbaring, tubuh kecil/jauh, tertutup orang lain,
+dan ID tertukar masih merupakan hambatan. Jumlah deteksi yang ditampilkan tidak
+menjamin semua orang di ruangan terlihat. Batas komputasi juga bisa membuat
+sebagian orang tidak dianalisis; periksa penanda pada layar dan CSV.
+
+## Membaca waktu dengan benar
+
+- **Deteksi/tracking ms:** satu panggilan YOLO + ByteTrack, termasuk transfer hasil.
+- **Analisis ms:** processor + satu prediksi VideoMAE pada klip satu orang.
+- **queue_ms:** waktu dari akhir klip sampai prediksi mulai, termasuk tracking/crop.
+- **Usia hasil:** waktu sejak frame akhir klip diambil sampai hasil diterima.
+- **Waktu alarm terhadap jatuh:** perlu label awal kejadian manual; belum sama
+  dengan waktu analisis. Ada waktu pengumpulan klip dan konfirmasi juga.
+
+Jika prediksi rata-rata 1,5 detik dan ada 3 orang dengan target tiap 1 detik,
+beban serial sekitar 4,5 detik kerja per detik sumber. Itu belum memenuhi target.
+Preview yang lancar juga tidak membuktikan alarm tiba tepat waktu.
+Ringkasan menandai bila perkiraan beban serial melebihi kapasitas target.
+
+Model/detector disiapkan sebelum sumber mulai dibaca. Waktu startup dipisah dari
+waktu prediksi; pengukuran prediksi tetap mencakup panggilan pertama VideoMAE.
+Replay dengan keterlambatan pembaca lebih dari 1 detik ditandai tidak stabil
+(`replay_timing_valid: false`). Jangan memakai sesi tersebut sebagai benchmark
+live yang representatif. CSV tetap menyimpan angka mentah.
 
 ## Keluaran
 
-Setiap sesi memiliki folder baru `outputs/<waktu>_yolo_<id>/`:
+Setiap sesi berada di `outputs/<waktu>_people_<id>/`:
 
-- `annotated.mp4`: video berkerangka dan ID, jika diaktifkan. Audio tidak disalin.
-- `landmarks.csv`: semua orang, dengan kolom `track_id` dan `segment_id`.
-- `tracks/track_0001.csv`, dst.: riwayat titik tubuh masing-masing ID.
-- `frames.csv`: satu baris per frame, termasuk saat tidak ada orang terdeteksi.
-- `detections.csv`: kotak semua deteksi, termasuk yang belum mendapat ID.
-- `alerts.csv`: waktu, ID, dan bukti numerik setiap dugaan jatuh yang terkonfirmasi.
-- `summary.json`: versi model, jumlah frame, kecepatan, dan statistik tiap ID.
-- `preview.jpg`: frame terakhir.
+- `tracking.csv`: kotak piksel, ID/segmen, skor, waktu deteksi, usia tracking,
+  serta `analysis_enabled` untuk orang dalam batas analisis.
+- `predictions.csv`: ID/segmen, rentang klip, semua skor, waktu analisis/antrean,
+  usia hasil, status identitas saat hasil tiba, dan klip yang kedaluwarsa.
+- `alerts.csv`: ID kejadian, ID/segmen historis, kamera, rentang klip, waktu hasil.
+- `summary.json`: konfigurasi, perangkat, rata-rata/p95, klip diganti/kedaluwarsa,
+  kehilangan segmen, jumlah ID, dan peringatan kapasitas.
+- `annotated.mp4`: semua frame file yang berhasil dibaca bila simpan aktif;
+  overlay menunjukkan informasi yang tersedia saat frame ditulis, bukan label
+  yang dipasang mundur setelah prediksi selesai. Audio tidak disalin.
+- `preview.jpg`: tampilan terakhir.
 
-Webcam mengekspor CSV, ringkasan, dan preview; video webcam tidak direkam.
-Semua frame video yang berhasil dibaca diproses. Preview boleh melewati tampilan
-frame agar antarmuka tetap responsif, tetapi ekspor tidak melewati frame tersebut.
+Webcam/RTSP tidak direkam oleh opsi simpan file ini. URL CCTV tidak ditulis ke
+ringkasan. Putus koneksi mengakhiri sesi; reconnect otomatis belum tersedia.
+Model, data, output, environment, dan cache tetap diabaikan Git.
 
-## Bagaimana keputusan jatuh dibuat
-
-Aturan dalam `fall_rules.py` memakai waktu video/kamera, sehingga kecepatan
-pemrosesan komputer tidak mengubah durasi pengamatan. Untuk satu ID, sistem:
-
-1. Menemukan pose tubuh awal yang cukup jelas dan tegak.
-2. Dalam 0,25–1,5 detik, bahu atau hidung harus turun setidaknya 27% dari tinggi
-   kotak tubuh awal, dengan laju minimal 32% tinggi tubuh per detik.
-3. Kotak tubuh harus melebar/mendatar, dan tepi bawahnya tetap dekat dengan
-   pijakan awal (tidak naik melebihi 10% tinggi tubuh awal). Ini membantu
-   memisahkan jatuh ke lantai dari rebah ke ranjang atau sofa yang lebih tinggi.
-4. Posisi mendatar itu harus berlangsung minimal 1,5 detik, dengan setidaknya
-   0,8 detik bukti kotak terdeteksi. Celah pelacakan maksimal 0,6 detik ditoleransi.
-
-Jika ByteTrack kehilangan ID saat tubuh sudah rebah, aturan boleh melanjutkan
-konfirmasi dengan deteksi tanpa ID yang kotaknya saling tumpang tindih minimal
-25% dan muncul dalam 0,6 detik di lokasi yang sama. Tanda `*` di video berarti
-ID untuk alarm tersebut sedang disambungkan sementara. Data pose tanpa ID
-tetap tidak diberi ID buatan di CSV titik tubuh. `alerts.csv` mencatat apakah
-konfirmasi alarm memakai kotak sementara tersebut (`evidence_source`).
-
-Satu kejadian hanya mengeluarkan satu alarm untuk ID yang sama. Sistem dapat
-siap lagi setelah orang tampak tegak selama 1,5 detik. Nilai ambang adalah
-konfigurasi awal untuk prototipe, bukan hasil kalibrasi CCTV rumah sakit.
-Jika pose awal, gerak turun, atau kotak akhir tidak cukup jelas, sistem bisa
-tidak memberi alarm. Gerakan sengaja yang cepat hingga berbaring di lantai
-juga dapat memenuhi aturan; petugas tetap harus memeriksa. ID yang tertukar
-karena orang berpapasan dapat memengaruhi hasil.
-
-Aturan ini membutuhkan gerakan jatuh yang benar-benar terlihat dari kamera
-tetap. Video yang baru mulai menyorot orang setelah ia tergeletak tidak
-memiliki riwayat penurunan tubuh. Sudut kamera dari atas juga dapat membuat
-orang rebah tampak tegak dalam koordinat gambar 2D. Kondisi itu memerlukan
-detektor keadaan rebah dan kalibrasi kamera/area lantai terpisah, atau model
-klasifikasi video yang diuji pada sudut serupa.
-
-### Format data versi 2
-
-Ada 17 baris per orang per frame. `x`, `y`, dan `bbox_*` dinormalisasi terhadap
-lebar/tinggi gambar. `confidence` adalah skor titik tubuh. Tidak ada koordinat
-3D; format ini berbeda dari ekspor 33 titik MediaPipe sebelumnya.
-
-- `observed=1`: ID terlihat pada frame ini.
-- `observed=0`, `track_status=temporarily_missing`: ID baru hilang (hingga 1 detik);
-  koordinat kosong, tidak menggunakan posisi terakhir sebagai posisi saat ini.
-- `keypoint_valid=1`: titik finite, di dalam gambar, dan confidence minimal 0.3.
-- `pose_usable=1`: setidaknya 6 titik valid, termasuk 2 titik dari bahu/pinggul.
-  Ini hanya aturan kualitas data, bukan keputusan jatuh.
-- `segment_id`: berubah setelah kehilangan pose atau pose berkualitas rendah.
-  Jangan membuat rangkaian training melintasi batas segmen atau sesi.
-
-Jika tidak ada deteksi, `frames.csv` tetap mencatat frame. Deteksi yang belum
-mendapat ID ditampilkan sebagai **Menunggu ID** dan dihitung di `unassigned_people`;
-tidak diberi identitas buatan di CSV titik tubuh. Kotaknya tetap dicatat di
-`detections.csv` agar keputusan alarm dapat diuji ulang tanpa menjalankan YOLO.
-
-ID hanya berlaku di sesi dan kamera yang sama. Satu orang dapat mendapat ID baru
-setelah tertutup atau keluar gambar; `unique_track_ids` bukan jumlah pasien unik.
-ByteTrack juga dapat menukar ID ketika orang berpapasan. `segment_id` memisahkan
-celah yang diketahui, tetapi tidak menjamin setiap pertukaran identitas terdeteksi.
-Ambang awal ID baru dipasang pada skor deteksi 0.6 untuk mengurangi ID palsu;
-orang yang kecil atau tertutup mungkin belum mendapat ID sampai terlihat lebih jelas.
-ID yang sudah terbentuk tetap dapat dipulihkan lewat deteksi berskor lebih rendah.
-
-## Pengujian dan langkah berikutnya
+## CLI dan tes
 
 ```powershell
-.\.venv-yolo\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv-yolo\Scripts\python.exe tests\check_video_pipeline.py data\gmdcsa_fall_01.mp4 data\gmdcsa_adl_02.mp4
+cd "D:\Codinganku\DETEKSI ORANG JATUH"
+.\.venv-yolo\Scripts\python.exe extract_pose.py "D:\video\cctv.mp4" --no-video
+.\.venv-yolo\Scripts\python.exe extract_pose.py "D:\video\cctv.mp4" --offline
+.\.venv-yolo\Scripts\python.exe extract_pose.py --camera 0 --max-people 3
 ```
 
-Uji integrasi memerlukan `data/ultralytics_bus.jpg` dari sumber di bawah. Klip
-buatan dari gambar ini hanya memeriksa beberapa orang, ID, celah data, dan ekspor;
-bukan bukti akurasi pada CCTV rumah sakit. Webcam fisik belum diuji.
+`--scene` memilih backend seluruh kamera sebagai pembanding. GUI menyediakan
+pilihan yang sama dengan mematikan **Analisis per orang**. Opsi tambahan:
+`--detection-fps`, `--max-people`, `--detector`, `--interval`, `--window`,
+`--threshold`, `--confirm`, `--max-age`, `--model-dir`, dan `--allow-download`.
+Menurunkan target FPS sampai sampel tidak cukup akan membuat klip tidak terbentuk.
 
-Berikutnya: rekam simulasi 3–5 orang bergerak/berpapasan pada sudut kamera yang
-dituju, beri label waktu jatuh dan bukan-jatuh (termasuk duduk cepat, membungkuk,
-berbaring di bangku/lantai), lalu ukur sensitivitas, alarm palsu per jam, dan
-waktu respons. Setel ambang dengan data latih; nilai akhir harus diperiksa pada
-video/pemeran lain. Classifier gerak terlatih dapat dibandingkan sebagai tahap
-lanjutan. Integrasi pemberitahuan ke petugas memerlukan kanal komunikasi nyata.
+```powershell
+.\.venv-yolo\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
+.\.venv-yolo\Scripts\python.exe tests\benchmark_people.py
+```
 
-Kode versi awal MediaPipe disimpan sebagai cadangan di `legacy_mediapipe_*`.
-Hasil sesi lama tidak diubah; perhatikan `schema_version` sebelum menggabungkan CSV.
+Benchmark memakai klip lokal yang tersedia, tanpa webcam atau unduhan. Klip
+multi-orang adalah fixture integrasi dari gambar contoh, bukan rekaman jatuh
+ramai di rumah sakit. Tes backend lama ada di `tests/legacy_pose/` sebagai arsip.
+`requirements.lock.txt` masih snapshot environment sebelumnya; launcher memakai
+`requirements.txt`. Hasil pengujian aktual ada di `VERIFIKASI.md`.
 
-## Sumber dan atribusi
+## Sumber
 
-- YOLO11 Pose: https://docs.ultralytics.com/models/yolo11/
-- Pelacakan ByteTrack: https://docs.ultralytics.com/modes/track/
-- Ultralytics dan model YOLO11 menggunakan AGPL-3.0 atau lisensi Enterprise:
-  https://github.com/ultralytics/ultralytics/blob/main/LICENSE
-- Model resmi: https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.pt
-- Gambar pengujian: https://raw.githubusercontent.com/ultralytics/assets/main/im/bus.jpg
-- Video GMDCSA-24: https://zenodo.org/records/13354453
+- VideoMAE fall checkpoint (CC-BY-NC-4.0):
+  https://huggingface.co/yadvender12/videomae-base-finetuned-kinetics-finetuned-fall-detect
+- Ultralytics YOLO/tracking (AGPL-3.0; opsi lisensi komersial terpisah):
+  https://docs.ultralytics.com/modes/track/
+- ByteTrack: https://github.com/ifzhang/ByteTrack
+- Sampel GMDCSA-24: https://zenodo.org/records/13354453
 
-File video/gambar sampel dan bobot model diabaikan Git. Cantumkan sumber dataset
-dalam laporan dan periksa izin sebelum mendistribusikan ulang datanya.
+Dataset latihan checkpoint VideoMAE belum dijelaskan lengkap oleh pembuatnya.
+Sistem ini prototipe, belum punya evaluasi akurasi pada CCTV rumah sakit.

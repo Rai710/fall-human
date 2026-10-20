@@ -1,30 +1,27 @@
-"""Fetch official Ultralytics YOLO11n-Pose weights for local use."""
+"""Download the three VideoMAE inference files, without starting the app."""
+import argparse
 from pathlib import Path
-import shutil
-from urllib.request import urlopen
 
-ROOT = Path(__file__).resolve().parent
-MODEL_PATH = ROOT / "models" / "yolo11n-pose.pt"
-MODEL_URL = "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.pt"
+MODEL_ID = "yadvender12/videomae-base-finetuned-kinetics-finetuned-fall-detect"
+FILES = ("config.json", "preprocessor_config.json", "model.safetensors")
+DEFAULT_OUTPUT = Path(__file__).resolve().parent / "models" / "videomae-fall"
 
 
-def download_model():
-    if MODEL_PATH.is_file() and MODEL_PATH.stat().st_size > 1_000_000:
-        print(f"Model tersedia: {MODEL_PATH}")
-        return MODEL_PATH
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = MODEL_PATH.with_suffix(".download")
-    try:
-        with urlopen(MODEL_URL, timeout=120) as source, temporary.open("wb") as output:
-            shutil.copyfileobj(source, output)
-        if temporary.stat().st_size < 1_000_000:
-            raise RuntimeError("Unduhan model tidak lengkap. Jalankan ulang MULAI.cmd.")
-        temporary.replace(MODEL_PATH)
-    finally:
-        temporary.unlink(missing_ok=True)
-    print(f"Model disimpan: {MODEL_PATH}")
-    return MODEL_PATH
+def download_model(output=DEFAULT_OUTPUT, revision="main"):
+    from huggingface_hub import snapshot_download
+
+    output = Path(output)
+    snapshot_download(repo_id=MODEL_ID, revision=revision,
+                      allow_patterns=list(FILES), local_dir=str(output))
+    if not all((output / name).is_file() for name in FILES):
+        raise RuntimeError("Unduhan model belum lengkap. Jalankan kembali untuk melanjutkan.")
+    print(f"Model VideoMAE tersimpan di: {output.resolve()}")
+    return output
 
 
 if __name__ == "__main__":
-    download_model()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--revision", default="main", help="Branch/tag atau hash revisi Hugging Face.")
+    args = parser.parse_args()
+    download_model(args.output, args.revision)
