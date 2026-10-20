@@ -10,7 +10,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Bobot model diunduh oleh start.ps1 saat aplikasi dijalankan
+# Model diunduh oleh start.ps1 / download_model.py saat pertama kali dijalankan
 models/
 
 # Video, gambar, dataset, serta hasil pemrosesan lokal
@@ -34,6 +34,7 @@ outputs/
 *.joblib
 
 # Konfigurasi dan informasi pribadi mesin
+.cuda_checked
 local_python.txt
 .env
 .env.*
@@ -43,9 +44,7 @@ local_python.txt
 *credentials*.json
 *.log
 
-# Salinan kode lama dan file editor
-backup_before_*/
-legacy_mediapipe_*/
+# File editor
 .idea/
 .vscode/
 .DS_Store

@@ -1,4 +1,9 @@
-ultralytics>=8.3,<9
-lap>=0.5.12,<0.6
-opencv-python>=4.10,<5
-Pillow>=10,<13
+# Dipasang otomatis oleh start.ps1 (MULAI.cmd). torch dan torchvision dipasang lebih dulu
+# oleh skrip itu dari indeks CUDA atau CPU yang cocok; baris di bawah memastikan versinya memadai.
+torch>=2.4
+torchvision>=0.19
+transformers>=4.40
+mediapipe>=0.10.30
+# mediapipe membutuhkan opencv-contrib-python. Jangan pasang opencv-python biasa bersamanya.
+opencv-contrib-python>=4.10
+Pillow>=10
