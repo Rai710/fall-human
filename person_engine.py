@@ -26,17 +26,12 @@ from live_core import AlarmGate, ClipBuffer, LiveConfig
 from person_core import PersonAnalyzer, PersonJob, TrackingConfig
 from pose_engine import ROOT, MODEL_NAME, _Capture, _percentile, load_model
 
-DETECTOR_PATH = ROOT / "models" / "yolo11n-pose.pt"
+DETECTOR_PATH = ROOT / "models" / "best_v5.pt"
+# DETECTOR_PATH = ROOT / "models" / "yolo11n-pose.pt"
 TRACKER_PATH = ROOT / "tracker.yaml"
 
 
 def crop_clip(clip, margin):
-    """Use one fixed square region for the whole clip, preserving fall motion.
-
-    A moving/recentered crop on every frame could erase spatial motion. The
-    region here is the union of the person's boxes across all real samples.
-    Black padding avoids center-cropping away limbs at image boundaries.
-    """
     boxes = np.asarray([sample[1] for sample in clip.frames], dtype=float)
     left, top = boxes[:, 0].min(), boxes[:, 1].min()
     right, bottom = boxes[:, 2].max(), boxes[:, 3].max()
