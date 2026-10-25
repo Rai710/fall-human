@@ -28,6 +28,7 @@ from pose_engine import ROOT, MODEL_NAME, _Capture, _percentile, load_model
 
 DETECTOR_PATH = ROOT / "models" / "best_v5.pt"
 # DETECTOR_PATH = ROOT / "models" / "yolo11n-pose.pt"
+
 TRACKER_PATH = ROOT / "tracker.yaml"
 
 
