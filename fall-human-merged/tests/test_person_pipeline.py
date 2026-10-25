@@ -94,7 +94,7 @@ class PipelineTests(unittest.TestCase):
         analyzer = PersonAnalyzer(predict, stop, 6)
         with tempfile.TemporaryDirectory() as directory:
             worker = TrackingWorker(FakeDetector(), "cpu", analyzer, PersonDisplay(False, config), stop, True,
-                config, TrackingConfig(detection_fps=30), 16, Path(directory))
+                config, TrackingConfig(detection_fps=30, lost_roi_seconds=0), 16, Path(directory))
             worker.start()
             try:
                 for index in range(50):
@@ -124,7 +124,7 @@ class PipelineTests(unittest.TestCase):
     def test_missing_identity_starts_new_clip_segment(self):
         stop = threading.Event()
         config = LiveConfig(window_seconds=0.8, analysis_interval=0.2)
-        tracking = TrackingConfig(detection_fps=30)
+        tracking = TrackingConfig(detection_fps=30, lost_roi_seconds=0)
         analyzer = PersonAnalyzer(lambda frames: {"label": "Standing"}, stop, 6)
         with tempfile.TemporaryDirectory() as directory:
             display = PersonDisplay(False, config)

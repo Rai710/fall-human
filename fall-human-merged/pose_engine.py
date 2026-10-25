@@ -7,6 +7,7 @@ from __future__ import annotations
 import csv
 from datetime import datetime, timezone
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -17,9 +18,10 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import cv2
-from PIL import Image
+from PIL import Image, ImageOps
 
 from live_core import AlarmGate, ClipBuffer, LatestAnalyzer, LiveConfig
+from mixed_model_config import read_mixed_settings, verify_mixed_export, mixed_rgb_image
 
 ROOT = Path(__file__).resolve().parent
 MODEL_NAME = "yadvender12/videomae-base-finetuned-kinetics-finetuned-fall-detect"
@@ -55,18 +57,57 @@ class VideoMAEPredictor:
                 "Mode lokal saja memerlukan model yang sudah lengkap.") from error
         self.num_frames = int(self.model.config.num_frames)
         self.labels = {int(index): str(label) for index, label in self.model.config.id2label.items()}
-        self.fall_id = next((index for index, label in self.labels.items() if label == "FallDown"), None)
-        if self.fall_id is None:
-            raise ValueError("Model yang dipilih tidak memiliki kelas FallDown.")
+        native = set(self.labels.values())
+        original = {"FallDown", "LyingDown", "SitDown", "Sitting", "StandUp", "Standing", "Walking"}
+        finetuned = {"normal", "fall", "lying"}
+        binary = {"no_fall", "fall"}
+        if native not in (original, finetuned, binary):
+            raise ValueError("Pilih HF asli, fine-tuning 3 kelas, atau Le2i + CAUCAFall 2 kelas.")
+        if set(self.labels) != set(range(len(self.labels))):
+            raise ValueError("ID kelas model harus berurutan mulai dari nol.")
+        self.model_kind = "finetuned2" if native == binary else "finetuned3" if native == finetuned else "hf_original7"
+        self.model_name = ("videomae_le2i_caucafall" if self.model_kind == "finetuned2" else
+                           "videomae_scene_finetuned" if self.model_kind == "finetuned3" else MODEL_NAME)
+        self.export_threshold = None
+        self.selected_checkpoint = None
+        if self.model_kind == "finetuned2":
+            settings = read_mixed_settings(source)
+            marker = verify_mixed_export(source)
+            if self.processor.do_resize or self.processor.do_center_crop:
+                raise ValueError("Processor dua kelas harus memakai letterbox tanpa resize/crop tambahan.")
+            self.export_threshold = float(settings["threshold"])
+            self.selected_checkpoint = marker["selected_checkpoint"]
+        self.fall_id = next(index for index, label in self.labels.items() if label in {"FallDown", "fall"})
+        self.input_scope_note = ("Trained on whole scenes; per-person crop transfer is not yet validated."
+                                 if self.model_kind in {"finetuned2", "finetuned3"} else
+                                 "Original HF checkpoint; per-person crop accuracy requires evaluation.")
         self.revision = getattr(self.model.config, "_commit_hash", None)
 
     def predict(self, frames):
-        inputs = self.processor(list(frames), return_tensors="pt")
+        frames = list(frames)
+        if len(frames) != self.num_frames:
+            raise ValueError(f"Model perlu {self.num_frames} gambar per klip.")
+        if self.model_kind == "finetuned2":
+            frames = [mixed_rgb_image(frame) for frame in frames]
+        elif self.model_kind == "finetuned3":
+            # Shared per-person crops are already 224x224 for BOTH checkpoints.
+            # The optional whole-scene mode produces rectangular PIL images;
+            # the fine-tuned processor disables resizing, so pad those first.
+            frames = [frame if isinstance(frame, Image.Image) else Image.fromarray(frame) for frame in frames]
+            frames = [frame if frame.size == (224, 224) else ImageOps.pad(
+                frame, (224, 224), method=Image.Resampling.BILINEAR, color=(127, 127, 127)) for frame in frames]
+        inputs = self.processor(frames, return_tensors="pt")
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
         with self.torch.inference_mode():
             scores = self.model(**inputs).logits.softmax(dim=-1)[0].float().cpu().tolist()
+        if len(scores) != len(self.labels) or any(not math.isfinite(value) for value in scores):
+            raise ValueError("Skor model tidak valid.")
         index = max(range(len(scores)), key=scores.__getitem__)
-        return {"label": self.labels[index], "confidence": scores[index],
+        digest = hashlib.sha256()
+        for frame in frames:
+            digest.update(str(frame.size).encode())
+            digest.update(frame.tobytes())
+        return {"label": self.labels[index], "confidence": scores[index], "input_sha256": digest.hexdigest(),
                 "fall_score": scores[self.fall_id],
                 "scores": {self.labels[i]: score for i, score in enumerate(scores)}}
 
@@ -85,6 +126,11 @@ def _image(frame):
     small = cv2.resize(frame, (round(width * scale), round(height * scale)),
                        interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
     return Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+
+
+def _mixed_image(frame):
+    # Resize from the original camera image exactly once, with black padding.
+    return mixed_rgb_image(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
 
 
 class _Display:
@@ -119,7 +165,7 @@ def _draw(frame, state, camera_name):
         text, color = "ALARM KAMERA: DIDUGA JATUH", (70, 70, 255)
     else:
         text = f"{state['label']} | skor {state['confidence']:.0%}"
-        color = (0, 190, 255) if state["label"] == "FallDown" else (140, 240, 140)
+        color = (0, 190, 255) if state["label"] in {"FallDown", "fall"} else (140, 240, 140)
     if state["alarm"]:
         cv2.rectangle(frame, (2, 2), (width - 3, height - 3), (0, 0, 255), 4)
     lines = [camera_name[:45], text]
@@ -134,12 +180,13 @@ def _draw(frame, state, camera_name):
 
 class _Capture:
     def __init__(self, source, mode, config, analyzer, display, stop, out_dir,
-                 save_video, num_frames, camera_name, frame_sink=None, renderer=None):
+                 save_video, num_frames, camera_name, frame_sink=None, renderer=None, image_factory=None):
         self.source, self.mode, self.config = source, mode, config
         self.analyzer, self.display, self.stop = analyzer, display, stop
         self.out_dir, self.save_video, self.camera_name = out_dir, save_video, camera_name
         self.frame_sink = frame_sink
         self.renderer = renderer or _draw
+        self.image_factory = image_factory or _image
         self.buffer = ClipBuffer(num_frames, config)
         self.condition = threading.Condition()
         self.done = threading.Event()
@@ -211,7 +258,7 @@ class _Capture:
                     self.frame_sink.offer((self.frames, ts, frame, acquired))
                     clip = None
                 else:
-                    clip = self.buffer.offer(ts, self.frames, acquired, lambda: _image(frame))
+                    clip = self.buffer.offer(ts, self.frames, acquired, lambda: self.image_factory(frame))
                 if clip and self.analyzer.submit(clip) and self.mode == "offline":
                     # Keep offline annotations synchronized with delivery of
                     # the prediction, rather than racing the UI/log consumer.
@@ -286,6 +333,8 @@ def process_source(source, save_video=True, stop=None, on_frame=None, realtime=T
     out_dir = Path(output_root or ROOT / "outputs") / (
         datetime.now().strftime("%Y%m%d_%H%M%S") + "_videomae_" + uuid4().hex[:6])
     out_dir.mkdir(parents=True, exist_ok=False)
+    if on_event:
+        on_event("session", out_dir)
     summary = {"schema_version": 3, "backend": "VideoMAE scene classification", "mode": mode,
                "camera_name": camera_name, "source": source_description, "model": MODEL_NAME,
                "person_tracking": False, "config": config.to_dict(), "status": "processing",
@@ -310,7 +359,13 @@ def process_source(source, save_video=True, stop=None, on_frame=None, realtime=T
              "Menyiapkan VideoMAE. Jika diperlukan, model sekitar 345 MB akan diunduh...")
         predictor = load_model(model_path, local_only)
         summary.update(device=predictor.device, model_source=predictor.source,
-                       model_revision=predictor.revision, num_frames=predictor.num_frames)
+                       model_revision=predictor.revision, num_frames=predictor.num_frames,
+                       model=getattr(predictor, "model_name", predictor.source),
+                       model_kind=getattr(predictor, "model_kind", "unknown"),
+                       model_labels=getattr(predictor, "labels", {}),
+                       export_threshold=getattr(predictor, "export_threshold", None),
+                       selected_checkpoint=getattr(predictor, "selected_checkpoint", None),
+                       input_scope_note=getattr(predictor, "input_scope_note", ""))
         if stop.is_set():
             summary["status"] = "stopped"
             return out_dir, summary
@@ -323,7 +378,8 @@ def process_source(source, save_video=True, stop=None, on_frame=None, realtime=T
             alerts.writeheader()
             analyzer = LatestAnalyzer(predictor.predict, stop)
             capture = _Capture(source, mode, config, analyzer, display, stop, out_dir,
-                               save_video, predictor.num_frames, camera_name)
+                               save_video, predictor.num_frames, camera_name,
+                               image_factory=_mixed_image if getattr(predictor, "model_kind", None) == "finetuned2" else None)
             emit("status", f"Membuka {camera_name}; mode {mode}. Menunggu klip pertama...")
             capture.start()
             finishing_message = False
@@ -385,7 +441,8 @@ def process_source(source, save_video=True, stop=None, on_frame=None, realtime=T
                                 "capture_fps": capture.frames / elapsed,
                                 "buffer_frames": len(capture.buffer.samples), "buffer_target": predictor.num_frames,
                                 "analyses": analyzer.completed, "replaced_clips": analyzer.replaced,
-                                "alerts_count": gate.event_count})
+                                "alerts_count": gate.event_count, "active_alarms": int(gate.latched),
+                                "infer_busy": analyzer.submitted > analyzer.completed})
                             preview_count += 1
                 if capture.done.is_set() and not analyzer.done.is_set() and not finishing_message:
                     emit("status", "Sumber selesai. Menunggu analisis yang masih berjalan dan menyimpan hasil...")

@@ -1,28 +1,24 @@
 {
   "_catatan": "Template model deteksi ORANG (bounding box). Ubah 'source' untuk ganti model. Bisa juga lewat env: DETECTOR_SOURCE, DETECTOR_LOCAL_PATH, DETECTOR_HF_REPO, DETECTOR_HF_FILENAME, DETECTOR_HF_REVISION, DETECTOR_CLASSES, HF_TOKEN.",
-
-  "source": "local", 
+  "source": "local",
   "_source_pilihan": "pretrained = yolo11n-pose bawaan Ultralytics | local = file best.pt di komputer | huggingface = unduh best.pt dari repo Hugging Face",
-
   "pretrained": {
     "name": "yolo11n-pose.pt",
     "auto_download": true
   },
-
   "local": {
-    "path": "models/best.pt"
+    "path": "models/YoloDetector.pt"
   },
-
   "huggingface": {
     "repo_id": "",
     "filename": "best.pt",
     "revision": "main",
     "token_env": "HF_TOKEN"
   },
-
-  "person_class_ids": [0],
+  "person_class_ids": [
+    0
+  ],
   "_person_class_ids": "Nomor kelas 'orang' di model. yolo11n-pose: [0]. Untuk model hasil train sendiri cek data.yaml (names). Isi null untuk memakai semua kelas.",
-
   "min_confidence": 0.1,
   "_min_confidence": "Sengaja rendah: ByteTrack butuh kotak skor rendah untuk mempertahankan ID. Ambang tampil/ID baru diatur di tracker.yaml."
 }

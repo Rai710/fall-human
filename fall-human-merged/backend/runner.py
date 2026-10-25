@@ -9,6 +9,8 @@ import uuid
 from pathlib import Path
 
 from . import PROJECT_ROOT
+from action_config import action_model_path, action_settings
+from live_core import LiveConfig
 
 os.environ.setdefault("HF_HOME", str(PROJECT_ROOT / ".cache" / "huggingface"))
 
@@ -54,11 +56,14 @@ def make_browser_playable(video: Path) -> bool:
 
 class SessionRunner:
     def __init__(self, source: Path | int, save_video: bool = True,
-                 realtime: bool = True, name: str | None = None):
+                 realtime: bool = False, name: str | None = None, analysis_scope: str = "scene"):
         self.id = uuid.uuid4().hex
         self.source = source
         self.save_video = save_video
         self.realtime = realtime
+        if analysis_scope not in {"scene", "person"}:
+            raise ValueError("Mode analisis harus scene atau person.")
+        self.analysis_scope = analysis_scope
         self.name = (name or (f"Webcam {source}" if isinstance(source, int) else "Video")).strip()
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name=f"session-{self.id[:8]}", daemon=True)
@@ -88,8 +93,14 @@ class SessionRunner:
             except Exception:  # noqa: BLE001
                 pass
             from person_engine import process_people
+            from pose_engine import process_source
 
-            out_dir, summary = process_people(
+            settings = action_settings()
+            config = LiveConfig(window_seconds=settings["clip_seconds"],
+                                analysis_interval=settings["stride_seconds"],
+                                fall_threshold=settings["threshold"], confirm_windows=1)
+            engine = process_people if self.analysis_scope == "person" else process_source
+            out_dir, summary = engine(
                 self.source,
                 save_video=self.save_video,
                 stop=self.stop_event,
@@ -97,8 +108,9 @@ class SessionRunner:
                 on_event=self._on_event,
                 realtime=self.realtime,
                 camera_name=self.name,
-                # Model VideoMAE (HF) diunduh otomatis pada sesi pertama bila belum ada.
-                local_only=False,
+                model_path=action_model_path(),
+                config=config,
+                local_only=True,
             )
             if self.save_video and not isinstance(self.source, int):
                 video = Path(out_dir) / "annotated.mp4"
@@ -136,6 +148,7 @@ class SessionRunner:
                     "label": payload.get("label"),
                     "confidence": payload.get("confidence"),
                     "fall_score": payload.get("fall_score"),
+                    "evidence_scope": payload.get("evidence_scope", "whole_scene" if self.analysis_scope == "scene" else "person_crop"),
                 })
 
     def _on_frame(self, frame, stats: dict) -> None:
@@ -148,7 +161,7 @@ class SessionRunner:
         mapped.update(
             inference_fps=stats.get("capture_fps"),
             is_fall=stats.get("active_alarms", 0) > 0,
-            infer_busy=stats.get("pending_people", 0) > 0,
+            infer_busy=bool(stats.get("infer_busy", stats.get("pending_people", 0) > 0)),
             last_result_age_ms=stats.get("result_age_ms"),
             device=self.device,
         )
@@ -163,6 +176,10 @@ class SessionRunner:
         self.stop_event.set()
         if self.thread.is_alive():
             self.thread.join(timeout)
+        if self.thread.is_alive():
+            with self.lock:
+                self.state = "stopping"
+                self.message = "Menunggu inferensi aktif berhenti..."
         return self.snapshot()
 
     def jpeg(self) -> bytes | None:
@@ -177,6 +194,7 @@ class SessionRunner:
                 "error": self.error,
                 "message": self.message,
                 "source": str(self.source),
+                "analysis_scope": self.analysis_scope,
                 "name": self.name,
                 "output": self.output_dir.name if self.output_dir else None,
                 "stats": dict(self.stats),
@@ -194,13 +212,13 @@ class SessionManager:
         self.active_id: str | None = None
 
     def start(self, source: Path | int, save_video: bool = True,
-              realtime: bool = True, name: str | None = None) -> SessionRunner:
+              realtime: bool = False, name: str | None = None, analysis_scope: str = "scene") -> SessionRunner:
         with self.lock:
             if self.active_id:
                 current = self.sessions.get(self.active_id)
-                if current and current.state in ("starting", "running"):
+                if current and (current.thread.is_alive() or current.state in ("starting", "running", "stopping")):
                     raise RuntimeError("Masih ada sesi yang berjalan. Hentikan sesi tersebut terlebih dahulu.")
-            runner = SessionRunner(source, save_video=save_video, realtime=realtime, name=name)
+            runner = SessionRunner(source, save_video=save_video, realtime=realtime, name=name, analysis_scope=analysis_scope)
             self.sessions[runner.id] = runner
             self.active_id = runner.id
         runner.start()
@@ -216,6 +234,6 @@ class SessionManager:
             return None
         snapshot = runner.stop()
         with self.lock:
-            if self.active_id == session_id:
+            if self.active_id == session_id and not runner.thread.is_alive():
                 self.active_id = None
         return snapshot

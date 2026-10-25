@@ -27,10 +27,17 @@ from person_core import PersonAnalyzer, PersonJob, TrackingConfig
 from detector_config import resolve_detector
 from pose_engine import ROOT, MODEL_NAME, _Capture, _percentile, load_model
 
+DETECTOR_PATH = ROOT / "models" / "yolo11n-pose.pt"
 TRACKER_PATH = ROOT / "tracker.yaml"
 
 
 def crop_clip(clip, margin):
+    """Use one fixed square region for the whole clip, preserving fall motion.
+
+    A moving/recentered crop on every frame could erase spatial motion. The
+    region here is the union of the person's boxes across all real samples.
+    Black padding avoids center-cropping away limbs at image boundaries.
+    """
     boxes = np.asarray([sample[1] for sample in clip.frames], dtype=float)
     left, top = boxes[:, 0].min(), boxes[:, 1].min()
     right, bottom = boxes[:, 2].max(), boxes[:, 3].max()
@@ -38,7 +45,8 @@ def crop_clip(clip, margin):
     x = math.floor((left + right - side) / 2)
     y = math.floor((top + bottom - side) / 2)
     images = []
-    for frame, _ in clip.frames:
+    for sample in clip.frames:
+        frame = sample[0]
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = max(0, x), max(0, y), min(w, x + side), min(h, y + side)
         if x2 <= x1 or y2 <= y1:
@@ -49,6 +57,32 @@ def crop_clip(clip, margin):
         patch = cv2.resize(patch, (224, 224), interpolation=cv2.INTER_AREA)
         images.append(Image.fromarray(cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)))
     return replace(clip, frames=tuple(images))
+
+
+def last_known_region(box, width, height):
+    """Bounded search area, NOT a predicted person box or fall decision.
+
+    Allow lateral/downward motion after a standing person's detection drops.
+    This region can contain other people; its identity is historical only.
+    """
+    x1, y1, x2, y2 = box
+    body_height, body_width = y2 - y1, x2 - x1
+    span = max(body_height, body_width)
+    center = (x1 + x2) / 2
+    return (max(0., center - .9 * span), max(0., y1 - .15 * body_height),
+            min(float(width), center + .9 * span), min(float(height), y2 + .5 * body_height))
+
+
+def dashed_box(frame, box, color):
+    x1, y1, x2, y2 = (int(value) for value in box)
+    for start, end in (((x1, y1), (x2, y1)), ((x2, y1), (x2, y2)),
+                       ((x2, y2), (x1, y2)), ((x1, y2), (x1, y1))):
+        length = max(abs(end[0] - start[0]), abs(end[1] - start[1]))
+        for offset in range(0, length, 18):
+            def point(distance):
+                fraction = min(distance, length) / max(1, length)
+                return tuple(round(a + (b - a) * fraction) for a, b in zip(start, end))
+            cv2.line(frame, point(offset), point(offset + 10), color, 2)
 
 
 class PersonDisplay:
@@ -74,7 +108,8 @@ class PersonDisplay:
 
     def is_current(self, job):
         with self.lock:
-            exists = any((r["track_id"], r["segment_id"]) == job.key for r in self.rows)
+            exists = any((r["track_id"], r["segment_id"]) == job.key
+                         and r.get("observation_status", "detected") == "detected" for r in self.rows)
             fresh = (not self.live or self.tracking_wall is not None
                      and time.monotonic() - self.tracking_wall <= 0.75)
             return exists and fresh
@@ -82,7 +117,9 @@ class PersonDisplay:
     def result(self, job, prediction, analysis_ms, stale, alarm):
         value = {**prediction, "analysis_ms": analysis_ms, "end_wall": job.clip.end_wall,
                  "stale": stale, "alarm": alarm, "track_id": job.track_id,
-                 "segment_id": job.segment_id}
+                 "segment_id": job.segment_id, "clip_sequence": job.clip.sequence,
+                 "clip_start_s": job.clip.start_s, "clip_end_s": job.clip.end_s,
+                 "evidence_scope": job.evidence_scope}
         with self.lock:
             self.last = value
             if alarm:
@@ -101,7 +138,9 @@ class PersonDisplay:
             value = dict(rows=rows, last=last, tracking_wall=tracking_wall,
                          detector_ms=self.detector_ms, detections=self.detections,
                          overflow=self.overflow, unassigned=self.unassigned,
-                         alarms=list(self.alarms))
+                         alarms=list(self.alarms),
+                         region_alarms=[key for key, result in self.alarms.items()
+                                        if result.get("evidence_scope") == "last_known_region"])
         now = time.monotonic()
         for row in rows:
             if "result" in row:
@@ -121,7 +160,8 @@ def draw_people(frame, state, camera_name):
     scale = max(0.4, min(0.7, min(height, width) / 650))
     if state["alarms"]:
         identities = ", ".join(f"{identity}.{segment}" for identity, segment in state["alarms"])
-        text = "DIDUGA JATUH | ID historis " + identities
+        text = ("DIDUGA JATUH DI AREA | ID historis " if state.get("region_alarms")
+                else "DIDUGA JATUH | ID historis ") + identities
         cv2.rectangle(frame, (2, 2), (width - 3, height - 3), (0, 0, 255), 3)
         cv2.putText(frame, text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(frame, text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, scale, (50, 50, 255), 1, cv2.LINE_AA)
@@ -130,9 +170,10 @@ def draw_people(frame, state, camera_name):
         result = row.get("result")
         stale = state["tracking_stale"] or result and result["stale"]
         color = (0, 180, 255) if stale else (100, 230, 130)
-        label = "mengumpulkan klip" if row["analysis_enabled"] else "DI LUAR BATAS ANALISIS"
+        label = (f"sampel {row['buffer_frames']}/16 | dibuat #{row.get('clip_sequence', 0)}"
+                 if row["analysis_enabled"] else "DI LUAR BATAS ANALISIS")
         if result:
-            label = f"{result['label']} {result['confidence']:.0%}"
+            label = f"{result['label']} {result['confidence']:.0%} | hasil #{result['clip_sequence']}"
             if result["alarm"]:
                 color = (40, 40, 255)
                 label = "DIDUGA JATUH | " + label
@@ -140,12 +181,28 @@ def draw_people(frame, state, camera_name):
                 label += " | HASIL LAMA"
         if state["tracking_stale"]:
             label = "TRACKING LAMA"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        lost_roi = row.get("observation_status") == "lost_roi"
+        if lost_roi:
+            color = (0, 180, 255)
+            label = f"TRACK HILANG {row['last_seen_age_ms']/1000:.1f}s | ROI TERAKHIR | " + label
+            dashed_box(frame, row["bbox"], color)
+        else:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        if result and result.get("evidence_scope") == "last_known_region":
+            label += " | HASIL AREA"
         text = f"ID {row['track_id']}.{row['segment_id']} | {label}"
-        position = (max(3, x1), max(22, y1 - 8))
+        if lost_roi:
+            text = f"ROI TERAKHIR {row['track_id']}.{row['segment_id']} | HILANG {row['last_seen_age_ms']/1000:.1f}s"
+            if result:
+                text += f" | {result['label']} {result['confidence']:.0%}"
+                if stale:
+                    text += " | LAMA"
+        text_width = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0]
+        position = (max(3, min(x1, width - text_width - 6)), max(22, y1 - 8))
         cv2.putText(frame, text, position, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(frame, text, position, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
-    text = f"{camera_name[:35]} | terlihat {state['detections']} | ID {len(state['rows'])}"
+    lost = sum(row.get("observation_status") == "lost_roi" for row in state["rows"])
+    text = f"{camera_name[:35]} | terlihat {state['detections']} | ROI terakhir {lost}"
     cv2.putText(frame, text, (12, height - 16), cv2.FONT_HERSHEY_SIMPLEX,
                 scale, (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(frame, text, (12, height - 16), cv2.FONT_HERSHEY_SIMPLEX,
@@ -158,7 +215,8 @@ class TrackingWorker:
     def __init__(self, detector, device, analyzer, display, stop, live, config,
                  tracking, num_frames, out_dir, classes=(0,), min_conf=0.1):
         self.detector, self.device = detector, device
-        self.classes, self.min_conf = (list(classes) if classes is not None else None), min_conf
+        self.classes = list(classes) if classes is not None else None
+        self.min_conf = min_conf
         self.analyzer, self.display, self.stop = analyzer, display, stop
         self.live, self.config, self.tracking = live, config, tracking
         self.num_frames, self.out_dir = num_frames, out_dir
@@ -170,7 +228,7 @@ class TrackingWorker:
         self.next_detection = 0.0
         self.last_processed = 0
         self.replaced = self.processed = self.peak_people = self.overflow_frames = 0
-        self.unassigned_frames = self.reset_count = 0
+        self.unassigned_frames = self.reset_count = self.roi_frames = self.roi_clips = 0
         self.timings, self.ages = [], []
         self.states, self.segments = {}, {}
         self.unique_ids = set()
@@ -204,7 +262,8 @@ class TrackingWorker:
         try:
             with (self.out_dir / "tracking.csv").open("w", newline="", encoding="utf-8") as log:
                 fields = ("frame", "timestamp_ms", "track_id", "segment_id", "confidence",
-                          "x1", "y1", "x2", "y2", "analysis_enabled", "detector_ms", "tracking_age_ms")
+                          "x1", "y1", "x2", "y2", "analysis_enabled", "detector_ms", "tracking_age_ms",
+                          "observation_status", "last_seen_age_ms")
                 writer = csv.DictWriter(log, fieldnames=fields)
                 writer.writeheader()
                 while True:
@@ -238,31 +297,46 @@ class TrackingWorker:
                     people = {int(identity): (tuple(map(float, box)), float(score))
                               for identity, box, score in zip(ids, xyxy, scores)
                               if np.isfinite(box).all() and box[2] > box[0] and box[3] > box[1]}
-                    # Keep a short gap without inventing observations. Split
-                    # only after the maximum allowed gap, even if an ID returns.
+                    # Retain only a bounded last-known REGION when detections vanish.
+                    # last_ts always means a REAL detection; fallback cannot renew it.
+                    retention = max(self.config.max_sample_gap, self.tracking.lost_roi_seconds)
                     for identity, state in list(self.states.items()):
-                        if ts - state["last_ts"] > self.config.max_sample_gap:
+                        if ts - state["last_ts"] > retention:
                             if state["active"]:
                                 state["active"] = False
                                 self.reset_count += 1
                             if ts - state["last_ts"] > 30:
                                 del self.states[identity]
-                    # Keep current admitted IDs before admitting newcomers.
-                    admitted = [identity for identity in people if identity in self.states and self.states[identity]["active"]]
+                    remembered = [identity for identity, state in self.states.items()
+                                  if state["active"] and identity not in people
+                                  and 0 < ts - state["last_ts"] <= self.tracking.lost_roi_seconds]
+                    # Preserve existing people and their brief missing regions before
+                    # admitting newcomers. Never merge a new ByteTrack ID by proximity.
+                    admitted = [identity for identity in people
+                                if identity in self.states and self.states[identity]["active"]]
+                    admitted += remembered
                     admitted += [identity for identity in people if identity not in admitted]
                     admitted = set(admitted[:self.tracking.max_people])
-                    overflow = len(people) - len(admitted)
+                    overflow = sum(identity not in admitted for identity in people)
                     self.overflow_frames += int(overflow > 0)
                     h, w = frame.shape[:2]
                     factor = min(1.0, 960 / max(h, w))
                     sample_frame = cv2.resize(frame, (round(w * factor), round(h * factor))) if factor < 1 else frame
                     rows, jobs = [], []
-                    for identity, (box, score) in people.items():
-                        self.unique_ids.add(identity)
+                    observations = [(identity, box, score, "detected", 0.)
+                                    for identity, (box, score) in people.items()]
+                    observations += [(identity, last_known_region(self.states[identity]["last_box"], w, h),
+                                      0., "lost_roi", (ts - self.states[identity]["last_ts"]) * 1000)
+                                     for identity in remembered if identity in admitted]
+                    self.roi_frames += int(any(item[3] == "lost_roi" for item in observations))
+                    for identity, box, score, status, last_seen_age in observations:
+                        if status == "detected":
+                            self.unique_ids.add(identity)
                         enabled = identity in admitted
                         if not enabled:
                             rows.append(dict(track_id=identity, segment_id=-1, bbox=box,
-                                             confidence=score, analysis_enabled=False, buffer_frames=0))
+                                             confidence=score, analysis_enabled=False, buffer_frames=0,
+                                             observation_status=status, last_seen_age_ms=last_seen_age))
                             continue
                         state = self.states.get(identity)
                         if state is None or not state["active"]:
@@ -270,16 +344,27 @@ class TrackingWorker:
                             self.segments[identity] = segment
                             state = dict(segment=segment, buffer=ClipBuffer(self.num_frames, self.config), active=True)
                             self.states[identity] = state
-                        state["last_ts"] = ts
+                        if status == "detected":
+                            state["last_ts"], state["last_box"] = ts, box
                         scaled_box = tuple(value * factor for value in box)
                         clip = state["buffer"].offer(ts, frame_no, acquired,
-                            lambda box=scaled_box: (sample_frame, box))
+                            lambda box=scaled_box, status=status: (sample_frame, box, status))
+                        samples = state["buffer"].samples
+                        span = samples[-1][0] - samples[0][0] if samples else 0.0
+                        reason = "mengisi sampel" if len(samples) < self.num_frames else "buffer bergulir"
+                        if len(samples) == self.num_frames and span > self.config.window_seconds + self.config.max_sample_gap:
+                            reason = "sampel terlalu jarang"
                         rows.append(dict(track_id=identity, segment_id=state["segment"], bbox=box,
                                          confidence=score, analysis_enabled=True,
-                                         buffer_frames=len(state["buffer"].samples)))
+                                         observation_status=status, last_seen_age_ms=last_seen_age,
+                                         buffer_frames=len(samples), buffer_span_s=span,
+                                         buffer_reason=reason, clip_sequence=state["buffer"].sequence))
                         if clip:
+                            scope = ("last_known_region" if any(sample[2] == "lost_roi" for sample in clip.frames)
+                                     else "person_crop")
+                            self.roi_clips += int(scope == "last_known_region")
                             jobs.append(PersonJob(identity, state["segment"],
-                                                  crop_clip(clip, self.tracking.crop_margin), box))
+                                                  crop_clip(clip, self.tracking.crop_margin), box, scope))
                     self.display.observations(rows, acquired, detector_ms, len(xyxy), overflow,
                                               len(xyxy) - len(ids))
                     for row in rows:
@@ -288,7 +373,9 @@ class TrackingWorker:
                             track_id=row["track_id"], segment_id=row["segment_id"], confidence=row["confidence"],
                             x1=box[0], y1=box[1], x2=box[2], y2=box[3],
                             analysis_enabled=int(row["analysis_enabled"]), detector_ms=round(detector_ms, 2),
-                            tracking_age_ms=round(tracking_age_ms, 2)))
+                            tracking_age_ms=round(tracking_age_ms, 2),
+                            observation_status=row["observation_status"],
+                            last_seen_age_ms=round(row["last_seen_age_ms"], 2)))
                     log.flush()
                     for job in jobs:
                         if self.analyzer.submit(job) and not self.live:
@@ -326,7 +413,7 @@ def process_people(source, save_video=True, stop=None, on_frame=None, realtime=T
     out_dir.mkdir(parents=True, exist_ok=False)
     if on_event:
         on_event("session", out_dir)
-    summary = dict(schema_version=4, backend="YOLO11 Pose + ByteTrack + per-person VideoMAE",
+    summary = dict(schema_version=5, backend="YOLO + ByteTrack + per-person VideoMAE",
         mode=mode, camera_name=camera_name, model=MODEL_NAME, person_tracking=True,
         source="network_camera" if network else str(source), status="processing",
         config=config.to_dict(), tracking_config=tracking.__dict__, alerts_count=0,
@@ -343,9 +430,7 @@ def process_people(source, save_video=True, stop=None, on_frame=None, realtime=T
             on_event(kind, payload)
 
     try:
-        emit("status", "Menyiapkan model deteksi orang (YOLO)...")
         if detector_path:
-            # Override eksplisit (CLI / pemanggil): pakai file ini apa adanya.
             detector_path = Path(detector_path)
             if not detector_path.is_file():
                 raise FileNotFoundError(f"File detektor tidak ditemukan: {detector_path}")
@@ -360,18 +445,14 @@ def process_people(source, save_video=True, stop=None, on_frame=None, realtime=T
         os.environ.setdefault("YOLO_CONFIG_DIR", str(ROOT / ".cache" / "ultralytics"))
         os.environ.setdefault("YOLO_AUTOINSTALL", "false")
         from ultralytics import YOLO
-        emit("status", "Memuat YOLO + ByteTrack dan VideoMAE...")
+        emit("status", "Memuat YOLO + ByteTrack dan VideoMAE lokal...")
         predictor = load_model(model_path, local_only)
         detector = YOLO(str(detector_path))
-        names = {int(k): str(v) for k, v in getattr(detector, "names", {}).items()}
+        names = {int(key): str(value) for key, value in getattr(detector, "names", {}).items()}
         if classes is not None:
-            missing = [c for c in classes if c not in names]
+            missing = [value for value in classes if value not in names]
             if missing:
-                raise ValueError(
-                    f"person_class_ids {missing} tidak ada di model detektor. "
-                    f"Kelas yang tersedia: {names}. Perbaiki di model_config.json.")
-        emit("status", f"Detektor: {Path(detector_path).name} ({detector_source}); "
-                       f"kelas dipakai: {[names.get(c, c) for c in classes] if classes is not None else 'semua'}")
+                raise ValueError(f"person_class_ids {missing} tidak ada di model detektor. Kelas tersedia: {names}.")
         device = "0" if predictor.device == "cuda" else "cpu"
         emit("status", "Menyiapkan detector/tracker sebelum sumber mulai dibaca...")
         detector.track(np.zeros((tracking.image_size, tracking.image_size, 3), np.uint8),
@@ -382,17 +463,21 @@ def process_people(source, save_video=True, stop=None, on_frame=None, realtime=T
         summary.update(device=predictor.device, detector_model=str(detector_path),
                        detector_source=detector_source, detector_classes=classes, detector_names=names,
                        model_source=predictor.source, model_revision=predictor.revision,
-                       num_frames=predictor.num_frames, startup_ms=(time.monotonic() - run_start) * 1000)
+                       num_frames=predictor.num_frames, startup_ms=(time.monotonic() - run_start) * 1000,
+                       model=getattr(predictor, "model_name", predictor.source),
+                       model_kind=getattr(predictor, "model_kind", "unknown"),
+                       model_labels=getattr(predictor, "labels", {}),
+                       input_scope_note=getattr(predictor, "input_scope_note", ""))
         if stop.is_set():
             summary["status"] = "stopped"
             return out_dir, summary
         display = PersonDisplay(live, config)
         prediction_fields = ("track_id", "segment_id", "sequence", "clip_start_ms", "clip_end_ms",
             "end_frame", "label", "confidence", "fall_score", "analysis_ms", "queue_ms", "result_age_ms",
-            "stale", "identity_current", "skipped", "fall_streak", "alert_id", "scores_json")
+            "stale", "identity_current", "skipped", "fall_streak", "alert_id", "input_sha256", "scores_json", "evidence_scope")
         alert_fields = ("alert_id", "person_event_id", "track_id", "segment_id", "camera_name",
             "clip_start_ms", "clip_end_ms", "delivered_source_ms", "label", "confidence", "fall_score",
-            "analysis_ms", "result_age_ms")
+            "analysis_ms", "result_age_ms", "evidence_scope")
         with (out_dir / "predictions.csv").open("w", newline="", encoding="utf-8") as pred_log, \
                 (out_dir / "alerts.csv").open("w", newline="", encoding="utf-8") as alert_log:
             predictions = csv.DictWriter(pred_log, fieldnames=prediction_fields)
@@ -402,8 +487,7 @@ def process_people(source, save_video=True, stop=None, on_frame=None, realtime=T
             analyzer = PersonAnalyzer(predictor.predict, stop, tracking.max_people,
                                       config.max_result_age if live else None)
             tracker = TrackingWorker(detector, device,
-                analyzer, display, stop, live, config, tracking, predictor.num_frames, out_dir,
-                classes=classes, min_conf=min_conf)
+                analyzer, display, stop, live, config, tracking, predictor.num_frames, out_dir, classes=classes, min_conf=min_conf)
             capture = _Capture(source, mode, config, analyzer, display, stop, out_dir,
                 save_video, predictor.num_frames, camera_name, frame_sink=tracker, renderer=draw_people)
             tracker.start()
@@ -433,7 +517,13 @@ def process_people(source, save_video=True, stop=None, on_frame=None, realtime=T
                         # A real clip can show a fall just before detection is
                         # lost. Its fresh result remains valid historical
                         # evidence; never attach it to a new ID/segment.
-                        event = gate.update(job.clip, prediction, stale or stop.is_set())
+                        if (job.evidence_scope == "last_known_region" and gate.latched
+                                and prediction["label"] in gate.RECOVERY_LABELS):
+                            # Another person may occupy this region: it cannot prove
+                            # that the missing patient recovered.
+                            gate.fall_streak = gate.recovery_streak = 0
+                        else:
+                            event = gate.update(job.clip, prediction, stale or stop.is_set())
                         display.result(job, prediction, duration, stale, gate.latched)
                     else:
                         gate.fall_streak = gate.recovery_streak = 0
@@ -442,6 +532,7 @@ def process_people(source, save_video=True, stop=None, on_frame=None, realtime=T
                         event.update(person_event_id=event["alert_id"], alert_id=summary["alerts_count"],
                             track_id=job.track_id, segment_id=job.segment_id, camera_name=camera_name,
                             analysis_ms=round(duration, 2), result_age_ms=round(age, 2),
+                            evidence_scope=job.evidence_scope,
                             delivered_source_ms=round(packet[1] * 1000) if packet else round(job.clip.end_s * 1000))
                         alerts.writerow(event)
                         alert_log.flush()
@@ -454,7 +545,8 @@ def process_people(source, save_video=True, stop=None, on_frame=None, realtime=T
                         analysis_ms=round(duration, 2), queue_ms=round(wait_ms, 2), result_age_ms=round(age, 2),
                         stale=int(stale), identity_current=int(current), skipped=int(skipped),
                         fall_streak=gate.fall_streak, alert_id=event["alert_id"] if event else "",
-                        scores_json=json.dumps(prediction["scores"])))
+                        input_sha256=prediction.get("input_sha256", ""), scores_json=json.dumps(prediction["scores"]),
+                        evidence_scope=job.evidence_scope))
                     pred_log.flush()
                     if not live:
                         analyzer.acknowledge(job)
@@ -475,15 +567,25 @@ def process_people(source, save_video=True, stop=None, on_frame=None, realtime=T
                         on_frame(last_preview, dict(frame=frame_no, timestamp_ms=round(timestamp * 1000),
                             total_frames=capture.total, mode=mode, camera_name=camera_name,
                             label=(f"ID {last['track_id']}.{last['segment_id']} {last['label']}" if last else ""),
+                            result_clip_sequence=last.get("clip_sequence"),
+                            result_clip_start_s=last.get("clip_start_s"), result_clip_end_s=last.get("clip_end_s"),
                             confidence=last.get("confidence", 0), fall_score=last.get("fall_score", 0),
                             stale=last.get("stale", False), analysis_ms=last.get("analysis_ms"),
                             result_age_ms=last.get("result_age_ms"), capture_fps=capture.frames / elapsed,
                             detector_ms=state["detector_ms"], tracking_stale=state["tracking_stale"],
                             tracking_fps=tracker.processed / elapsed, detections=state["detections"],
-                            tracked_people=len(state["rows"]), overflow_people=state["overflow"],
+                            tracked_people=sum(r.get("observation_status") == "detected" for r in state["rows"]),
+                            lost_regions=sum(r.get("observation_status") == "lost_roi" for r in state["rows"]),
+                            evidence_scope=last.get("evidence_scope", ""), overflow_people=state["overflow"],
                             buffer_frames=max((r["buffer_frames"] for r in state["rows"]), default=0),
                             buffer_target=predictor.num_frames, analyses=analyzer.completed,
                             replaced_clips=analyzer.replaced, expired_clips=analyzer.expired,
+                            submitted_clips=analyzer.submitted,
+                            person_buffers=[dict(track_id=r["track_id"], segment_id=r["segment_id"],
+                                frames=r["buffer_frames"], span_s=r.get("buffer_span_s", 0),
+                                reason=("ROI terakhir; " if r.get("observation_status") == "lost_roi" else "")
+                                       + r.get("buffer_reason", "di luar batas analisis"),
+                                clip_sequence=r.get("clip_sequence", 0)) for r in state["rows"]],
                             pending_people=len(analyzer.pending), alerts_count=summary["alerts_count"],
                             active_alarms=len(state["alarms"])))
                         preview_count += 1
@@ -536,7 +638,10 @@ def process_people(source, save_video=True, stop=None, on_frame=None, realtime=T
                 detector_p95_ms=_percentile(tracker.timings, 0.95),
                 tracking_age_p95_ms=_percentile(tracker.ages, 0.95), peak_people=tracker.peak_people,
                 unique_track_ids=len(tracker.unique_ids), clip_segment_resets=tracker.reset_count,
-                overflow_frames=tracker.overflow_frames, unassigned_frames=tracker.unassigned_frames)
+                overflow_frames=tracker.overflow_frames, unassigned_frames=tracker.unassigned_frames,
+                last_known_roi_frames=tracker.roi_frames, last_known_roi_clips=tracker.roi_clips)
+            if tracker.roi_frames:
+                summary["warnings"].append("ROI terakhir memakai frame baru, bukan posisi orang terkonfirmasi; hasil area dapat mencakup orang lain.")
             if tracker.overflow_frames:
                 summary["warnings"].append("Jumlah orang melewati batas analisis; lihat analysis_enabled di tracking.csv.")
         mean_ms = sum(inference_times) / len(inference_times) if inference_times else None

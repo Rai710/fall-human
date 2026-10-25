@@ -1,0 +1,75 @@
+# Dependencies and local Python environments
+node_modules/
+.venv*/
+venv/
+env/
+
+# Generated frontend output
+dist/
+dist-ssr/
+build/
+coverage/
+.vite/
+*.tsbuildinfo
+
+# Caches and logs
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Model weights and local inference/training artifacts
+models/
+datasets/
+outputs/
+runs/
+recordings/
+captures/
+backup_before_*/
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.ckpt
+*.h5
+*.hdf5
+*.tflite
+*.task
+*.engine
+
+# Local recordings and archives
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+
+# Machine-specific configuration and credentials
+local_python.txt
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+*credentials*.json
+*service-account*.json
+*service_account*.json
+*secrets*.json
+.streamlit/secrets.toml
+
+# Editors and OS files
+.idea/
+.DS_Store
+Thumbs.db

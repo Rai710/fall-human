@@ -253,7 +253,7 @@ export default function History({ focusId }: Props) {
                         <tr key={`${key}-${index}`}>
                           <td className="mono">{formatClock(alert.timestamp_ms)}</td>
                           <td className="mono">
-                            {alert.track_id ? `${alert.track_id}.${alert.segment_id ?? 0}` : '—'}
+                            {alert.track_id ? `${alert.evidence_scope === 'last_known_region' ? 'Area ' : ''}${alert.track_id}.${alert.segment_id ?? 0}` : '—'}
                           </td>
                           <td>{alert.label ?? 'fall'}</td>
                           <td className="mono">{formatConfidence(alert.confidence)}</td>
@@ -302,7 +302,7 @@ export default function History({ focusId }: Props) {
                       <tr key={index}>
                         <td className="mono">{formatClock(row.timestamp_ms)}</td>
                         <td className="mono">
-                          {row.track_id ? `${row.track_id}.${row.segment_id ?? 0}` : '—'}
+                          {row.track_id ? `${row.evidence_scope === 'last_known_region' ? 'Area ' : ''}${row.track_id}.${row.segment_id ?? 0}` : '—'}
                         </td>
                         <td>{row.label ?? '—'}</td>
                         <td className="mono">{formatConfidence(row.confidence)}</td>

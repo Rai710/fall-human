@@ -185,7 +185,7 @@ class LatestAnalyzer:
 
 class AlarmGate:
     """Confirm camera events; stale results never confirm or clear an alarm."""
-    RECOVERY_LABELS = {"Standing", "Walking", "Sitting"}
+    RECOVERY_LABELS = {"Standing", "Walking", "Sitting", "normal", "no_fall"}
 
     def __init__(self, config: LiveConfig):
         self.config = config
@@ -204,14 +204,15 @@ class AlarmGate:
                 > max(self.config.window_seconds, self.config.analysis_interval * 2.5)):
             self.fall_streak = self.recovery_streak = 0
         self.last_clip_end = clip.end_s
-        falling = (prediction["label"] == "FallDown"
+        binary = set(prediction.get("scores", {})) == {"no_fall", "fall"}
+        falling = ((binary or prediction["label"] in {"FallDown", "fall"})
                    and prediction["fall_score"] >= self.config.fall_threshold)
         if falling:
             self.fall_streak += 1
             self.recovery_streak = 0
         else:
             self.fall_streak = 0
-            if prediction["label"] in self.RECOVERY_LABELS:
+            if binary or prediction["label"] in self.RECOVERY_LABELS:
                 self.recovery_streak += 1
                 if self.recovery_streak >= self.config.recovery_windows:
                     self.latched = False
@@ -225,6 +226,7 @@ class AlarmGate:
             return {"alert_id": self.event_count,
                     "clip_start_ms": round(clip.start_s * 1000),
                     "clip_end_ms": round(clip.end_s * 1000),
-                    "label": prediction["label"], "confidence": prediction["confidence"],
+                    "label": "fall" if binary else prediction["label"],
+                    "confidence": prediction["fall_score"] if binary else prediction["confidence"],
                     "fall_score": prediction["fall_score"]}
         return None

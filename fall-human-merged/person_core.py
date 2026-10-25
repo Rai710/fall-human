@@ -15,6 +15,7 @@ class TrackingConfig:
     image_size: int = 416
     max_people: int = 6
     crop_margin: float = 0.2
+    lost_roi_seconds: float = 2.0
 
     def __post_init__(self):
         if not math.isfinite(self.detection_fps) or not 1 <= self.detection_fps <= 30:
@@ -26,6 +27,9 @@ class TrackingConfig:
         if not math.isfinite(self.crop_margin) or not 0 <= self.crop_margin <= 1:
             raise ValueError("Margin crop harus antara 0 dan 1.")
 
+        if not math.isfinite(self.lost_roi_seconds) or not 0 <= self.lost_roi_seconds <= 5:
+            raise ValueError("Durasi ROI terakhir harus antara 0 dan 5 detik.")
+
 
 @dataclass(frozen=True)
 class PersonJob:
@@ -33,6 +37,7 @@ class PersonJob:
     segment_id: int
     clip: Clip
     bbox: tuple
+    evidence_scope: str = "person_crop"
 
     @property
     def key(self):

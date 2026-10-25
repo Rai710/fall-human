@@ -9,6 +9,7 @@ export type AlertRow = {
   fall_streak?: string | number
   segment_id?: string | number
   fall_score?: string | number
+  evidence_scope?: string
 }
 
 export type LiveStats = {
@@ -31,6 +32,15 @@ export type LiveStats = {
   detector_ms?: number | null
   tracking_stale?: boolean
   active_alarms?: number
+}
+
+export type ActionModelInfo = {
+  label: string
+  ready: boolean
+  labels: Record<string, string>
+  threshold: number | null
+  clip_seconds: number | null
+  stride_seconds: number | null
 }
 
 export type DetectorInfo = {
@@ -60,6 +70,7 @@ export type Snapshot = {
   message?: string
   source: string
   name?: string
+  analysis_scope?: "scene" | "person"
   output: string | null
   stats: LiveStats
   alerts: AlertRow[]
@@ -118,8 +129,8 @@ export function getSession(id: string): Promise<SessionDetail> {
   return request<SessionDetail>(`/api/sessions/${id}`)
 }
 
-export function getConfig(): Promise<{ detector: DetectorInfo }> {
-  return request<{ detector: DetectorInfo }>('/api/config')
+export function getConfig(): Promise<{ detector: DetectorInfo; action_model: ActionModelInfo }> {
+  return request<{ detector: DetectorInfo; action_model: ActionModelInfo }>('/api/config')
 }
 
 export function listSessions(): Promise<SessionListItem[]> {

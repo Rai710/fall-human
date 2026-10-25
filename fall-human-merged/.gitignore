@@ -74,3 +74,23 @@ legacy_mediapipe_*/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Dependensi dan hasil build web (aturan juga berlaku bila folder ini berdiri sendiri)
+node_modules/
+dist/
+dist-ssr/
+build/
+coverage/
+.vite/
+*.tsbuildinfo
+*.local
+
+# Aset antarmuka React tetap dapat disimpan di Git
+!frontend/public/**/*.png
+!frontend/public/**/*.jpg
+!frontend/public/**/*.jpeg
+!frontend/public/**/*.webp
+!frontend/src/assets/**/*.png
+!frontend/src/assets/**/*.jpg
+!frontend/src/assets/**/*.jpeg
+!frontend/src/assets/**/*.webp

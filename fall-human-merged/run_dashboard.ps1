@@ -7,7 +7,16 @@ $Frontend    = Join-Path $ProjectRoot 'frontend'
 $Dist        = Join-Path $Frontend 'dist'
 
 if (!(Test-Path -LiteralPath $VenvPython)) {
-    throw 'Virtualenv .venv-yolo tidak ditemukan. Jalankan setup_dashboard.cmd terlebih dahulu.'
+    $LocalPython = Join-Path $ProjectRoot 'local_python.txt'
+    if (Test-Path -LiteralPath $LocalPython) {
+        $ConfiguredPython = (Get-Content -LiteralPath $LocalPython -Raw).Trim()
+        if (Test-Path -LiteralPath $ConfiguredPython -PathType Leaf) {
+            $VenvPython = $ConfiguredPython
+        }
+    }
+}
+if (!(Test-Path -LiteralPath $VenvPython)) {
+    throw 'Runtime Python belum tersedia. Jalankan setup_dashboard.cmd terlebih dahulu.'
 }
 
 if (!(Test-Path -LiteralPath $Dist)) {

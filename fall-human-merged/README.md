@@ -1,92 +1,113 @@
-# Fall Detection — Dashboard + engine per-orang
+# Deteksi orang jatuh — React + FastAPI + YOLO + VideoMAE
 
-Gabungan dua proyek:
+Dashboard ini menggabungkan **YoloDetector.pt** milik tim detector dengan
+**VideoMAE Le2i + CAUCAFall dua kelas** (`no_fall`, `fall`). Integrasi dikerjakan
+pada source `fall-human-merged` di checkout branch `final`.
 
-- **UI**: dashboard React (`frontend/`) + API FastAPI (`backend/`) dari `fall-human-feat-dashboard`.
-- **Engine**: `person_engine.py`, `person_core.py`, `live_core.py`, `pose_engine.py` dari `fall-human-BON`
-  (YOLO → ByteTrack → klip 16 frame per orang → VideoMAE → alarm).
+## Menjalankan di komputer ini
+
+Klik **run_dashboard.cmd**, lalu buka **http://localhost:8000**.
+Launcher memakai `.venv-yolo` jika tersedia, atau interpreter lokal yang
+dikonfigurasi dalam `local_python.txt` (diabaikan Git). Build React disediakan
+di `frontend/dist`. Kamera belum dibuka saat dashboard baru diakses.
+
+Untuk instalasi mandiri pada komputer lain, jalankan `setup_dashboard.cmd`, lalu
+`run_dashboard.cmd`. Python 3.10–3.13 dan Node/npm diperlukan. Bobot model tidak
+ikut Git; salin kedua paket model secara terpisah.
+
+## Dua mode analisis
+
+1. **Seluruh kamera** (default): VideoMAE membaca adegan penuh dengan cara input
+   yang sesuai training. Mode ini tidak menjalankan YOLO/ByteTrack dan tidak
+   mengidentifikasi siapa yang jatuh.
+2. **Per orang** (eksperimen): YOLO → ByteTrack → klip RGB/crop per ID → VideoMAE.
+   Bobot classifier yang sama dipakai bergantian untuk klip setiap orang.
+   Crop mengubah input dari training seluruh adegan dan memerlukan evaluasi
+   akurasi tersendiri. Area terakhir saat track hilang diberi penanda khusus.
+
+Mulai dengan **Upload video**; simulasi live pada file mati secara default.
+Mode offline menunggu analisis klip sehingga waktu proses dapat melebihi durasi
+video. Webcam selalu mengikuti penjadwalan live, walaupun pilihan replay file
+tidak aktif. Webcam index menunjuk kamera mesin backend, bukan browser pengguna.
+
+## Bobot yang diperlukan
 
 ```text
-Browser (React) ──HTTP/WS──> backend/ (FastAPI) ──> person_engine.process_people
-                                                      ├─ Model 1: YOLO deteksi orang  (model_config.json)
-                                                      └─ Model 2: VideoMAE deteksi jatuh (Hugging Face)
+models/
+├── YoloDetector.pt
+└── best_model-20261025T045257Z-1-001/
+    └── best_model/
+        ├── model.safetensors
+        ├── config.json
+        ├── preprocessor_config.json
+        ├── inference_config.json
+        ├── export_complete.json
+        └── ... seluruh berkas ekspor lainnya
 ```
 
-## Menjalankan (Windows)
+YOLO bertipe `detect`, kelas **0 = person**. `model_config.json` menunjuk
+`models/YoloDetector.pt`; opsi lokal/pretrained/Hugging Face tetap tersedia.
 
-1. `setup_dashboard.cmd` (sekali saja: membuat `.venv-yolo`, memasang dependensi).
-2. `run_dashboard.cmd` → buka http://localhost:8000.
-3. Pilih webcam atau upload video → **Mulai monitoring**.
+Classifier memakai epoch 4 (`mixed_fine_tuning`), input 16 gambar RGB sekitar
+2 detik, letterbox hitam PIL bilinear 224×224, normalisasi processor tersimpan,
+stride 0,5 detik dan satu konfirmasi awal. Threshold ekspor tetap **0,58**;
+ambang alarm aplikasi dinaikkan menjadi **0,70 (70%)** di `action_config.py`. Dua hasil
+di bawah ambang memulihkan gate untuk kejadian berikutnya. Label positif mencakup
+gerakan jatuh atau keadaan setelah jatuh. Skor belum terkalibrasi sebagai peluang.
 
-Sesi pertama mengunduh dua hal otomatis: `yolo11n-pose.pt` (±6 MB) dan model VideoMAE dari Hugging Face
-(±345 MB, `yadvender12/videomae-base-finetuned-kinetics-finetuned-fall-detect`). Setelah itu jalan offline.
-Aplikasi desktop lama tetap ada: `MULAI.cmd`.
+Dashboard memakai paket lokal secara eksplisit. Tidak ada unduhan atau fallback
+otomatis ke model HF tujuh kelas ketika classifier ini tidak lengkap. Loader
+memeriksa hash ekspor; pertahankan seluruh isi `best_model` tanpa mengubahnya.
 
-Mode pengembangan UI: `uvicorn backend.main:app --port 8000` + `npm --prefix frontend run dev` (http://localhost:5173).
+## Bagian aplikasi
 
-## Ganti model deteksi ORANG (Model 1)
+- `frontend/`: React/TypeScript/Vite; upload, progres, alarm, review, dan riwayat.
+- `backend/`: FastAPI; sesi, preview MJPEG, event WebSocket, laporan dan video.
+- `action_config.py`: lokasi/metadata classifier dua kelas.
+- `mixed_model_config.py`: validasi ekspor dan preprocessing sesuai training.
+- `pose_engine.py`: loader classifier dan analisis seluruh kamera.
+- `person_engine.py`: YOLO/ByteTrack, crop per orang, dan pengelolaan track hilang.
+- `live_core.py`, `person_core.py`: buffer, antrean, dan gate alarm.
 
-Semua diatur di **`model_config.json`**. Default: `yolo11n-pose` bawaan Ultralytics.
+API `POST /api/sessions/start` menerima file atau index webcam, `save_video`,
+`realtime` (file default false), dan `analysis_scope` (`scene` atau `person`,
+default `scene`). `GET /api/config` menjelaskan detector dan classifier aktif.
+Satu sesi aktif diizinkan per proses backend; permintaan lain ditolak HTTP 409,
+bukan dimasukkan ke antrean pengguna. Jangan jalankan beberapa worker Uvicorn
+untuk berbagi model/session state pada implementasi ini.
 
-| `source` | Artinya | Yang perlu diisi |
-| --- | --- | --- |
-| `pretrained` (default) | `yolo11n-pose.pt`, diunduh otomatis ke `models/` | — |
-| `local` | `best.pt` hasil train sendiri | taruh di `models/best.pt` atau ubah `local.path` |
-| `huggingface` | `best.pt` di repo Hugging Face | `huggingface.repo_id` (+ `filename`, `revision`) |
+Output di `outputs/<sesi>/`: video H.264 bila konversi berhasil, prediksi/alarm
+CSV, summary JSON, preview, dan review. Riwayat lama tetap bisa dibaca.
 
-Contoh memakai model sendiri dari file lokal:
+## Pengembangan dan pengujian
 
-```json
-{ "source": "local", "local": { "path": "models/best.pt" }, "person_class_ids": [0] }
-```
+Backend: `python -m uvicorn backend.main:app --port 8000`.
+Frontend: `npm --prefix frontend ci`, lalu `npm --prefix frontend run dev`.
+Frontend dev mem-proxy `/api` dan WebSocket ke port 8000. Build: `npm --prefix frontend run build`.
 
-Contoh dari Hugging Face (repo privat: set env `HF_TOKEN` dulu):
-
-```json
-{ "source": "huggingface",
-  "huggingface": { "repo_id": "usernamemu/human-detector", "filename": "best.pt" },
-  "person_class_ids": [0] }
-```
-
-Tanpa edit file, bisa lewat environment variable, mis. `set DETECTOR_SOURCE=local` lalu jalankan
-`run_dashboard.cmd`. Variabel lain: `DETECTOR_LOCAL_PATH`, `DETECTOR_HF_REPO`, `DETECTOR_HF_FILENAME`,
-`DETECTOR_HF_REVISION`, `DETECTOR_CLASSES`, `HF_TOKEN`.
-`python download_detector.py` menyiapkan model tanpa membuka aplikasi.
-
-**Perhatikan `person_class_ids`.** Ini nomor kelas "orang" di modelmu (lihat `names:` di `data.yaml` saat train).
-`yolo11n-pose` memakai `0`. Jika modelmu punya kelas lain atau urutannya beda, isi sesuai. Salah nomor akan
-ditolak dengan pesan yang menyebut daftar kelas model. Model deteksi biasa (bukan pose) tidak masalah:
-engine hanya memakai kotak, bukan keypoint.
-
-Model deteksi **jatuh** (Model 2) tetap VideoMAE dari Hugging Face seperti di zip BON. Saat model temanmu
-siap, titik gantinya ada di `pose_engine.py` (`MODEL_NAME` / `LOCAL_MODEL`) atau folder lewat `model_path`.
-
-## Yang diubah dari dua zip asal
-
-- `person_engine.py`: detektor tidak lagi hard-coded `best_v5.pt` dan tidak dipaksa `task="pose"`;
-  kelas orang & confidence dari config; event `session` (folder keluaran) dan `active_alarms` untuk UI.
-- `detector_config.py`, `model_config.json`, `download_detector.py`: baru.
-- `backend/runner.py`: sekarang memanggil `process_people` (sebelumnya `process_source`) dan memetakan
-  statistik/alarm ke format UI; mengonversi `annotated.mp4` ke H.264 agar bisa diputar di browser
-  (butuh `ffmpeg` atau `imageio-ffmpeg`, sudah ada di `requirements.txt`).
-- `backend/repository.py`: menyelaraskan nama kolom CSV engine (`clip_end_ms` → `timestamp_ms`, dst.).
-- `frontend/`: tampilan sama; ditambah ID orang di log alert/riwayat, kartu "Orang terlacak", info detektor
-  aktif, dan centang "Ikuti waktu video (simulasi live)" untuk upload.
-
-## Tes
+Tes otomatis: `python -m pytest -q`. Tes API/engine memakai model palsu;
+tes tersebut tidak mengukur akurasi. Uji kedua model asli lewat API:
 
 ```powershell
-.\.venv-yolo\Scripts\python.exe -m pytest -q
+python tests/smoke_real_models.py "D:\video\contoh.mp4"
 ```
 
-Tes integrasi memakai YOLO/VideoMAE palsu; tidak mengunduh model.
+Lihat **INTEGRASI_MODEL.md** untuk perbandingan sebelum/sesudah dan hasil uji aktual.
+`README_ENGINE.md` dan `VERIFIKASI.md` adalah dokumentasi engine versi sebelumnya.
+Aplikasi desktop `MULAI.cmd` tetap merupakan entry point lama; gunakan dashboard
+untuk konfigurasi gabungan terbaru ini.
 
-## Catatan penting
+## Batas integrasi
 
-- **Belum diuji dengan model sungguhan.** Rangkaian API → engine → riwayat diuji dengan model palsu,
-  dan frontend lolos build/lint. Jalankan satu video nyata sebelum percaya hasilnya.
-- Di CPU, VideoMAE ±1–2 detik per klip per orang. Dengan "simulasi live" aktif, hasil yang lebih tua dari
-  3 detik dibuang dan alarm bisa terlewat; matikan centang itu untuk analisis lengkap (lebih lambat dari waktu video).
-- "api HF" di sini berarti **mengunduh bobot dari Hugging Face Hub**, lalu dijalankan lokal. Memanggil model
-  yang di-host di Inference Endpoint/Space (tanpa unduh) belum disediakan.
-- Lisensi: Ultralytics AGPL-3.0, checkpoint VideoMAE CC-BY-NC-4.0 (non-komersial). Detail di `README_ENGINE.md`.
+Model terbaru pernah salah menandai orang rebah di kasur sebagai fall. Integrasi
+tidak memperbaiki akurasi bobot atau membuktikan performa CCTV multi-orang.
+Stride 0,5 detik tidak menjamin inferensi selesai setiap 0,5 detik. CPU dapat
+tertinggal pada mode live; crop per orang perlu dievaluasi secara terpisah.
+
+Source ini disiapkan untuk lokal/satu origin. Deployment frontend dan backend
+terpisah masih memerlukan konfigurasi URL API/WebSocket, CORS, kontrol akses,
+dan penyimpanan hasil yang sesuai. Belum ada deployment cloud dalam pekerjaan ini.
+
+Checkpoint asal VideoMAE mencantumkan CC BY-NC 4.0; Ultralytics memakai AGPL-3.0
+atau lisensi komersial yang sesuai. Ketentuan bobot YOLO custom perlu mengikuti
+asal training dan izin tim pembuatnya.

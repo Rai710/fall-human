@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from fastapi import (
     FastAPI,
@@ -22,6 +23,7 @@ from pydantic import BaseModel, Field
 from . import FRONTEND_DIST, UPLOADS_DIR
 from . import repository
 from detector_config import describe_detector, load_config
+from action_config import describe_action
 from .runner import SessionManager
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
@@ -60,7 +62,7 @@ def health() -> dict:
 def get_config() -> dict:
     """Model deteksi orang yang aktif (dari model_config.json). Tidak mengunduh apa pun."""
     try:
-        return {"detector": describe_detector(load_config())}
+        return {"detector": describe_detector(load_config()), "action_model": describe_action()}
     except ValueError as exc:
         raise HTTPException(500, str(exc)) from exc
 
@@ -70,7 +72,8 @@ async def start_session(
     file: UploadFile | None = File(None),
     camera_index: str = Form(""),
     save_video: bool = Form(True),
-    realtime: bool = Form(True),
+    realtime: bool = Form(False),
+    analysis_scope: Literal["scene", "person"] = Form("scene"),
 ) -> dict:
     upload_path: Path | None = None
     source: Path | int | None = None
@@ -109,7 +112,7 @@ async def start_session(
         raise HTTPException(400, "Pilih file video atau isi nomor webcam.")
 
     try:
-        runner = manager.start(source, save_video=save_video, realtime=realtime, name=display_name)
+        runner = manager.start(source, save_video=save_video, realtime=realtime, name=display_name, analysis_scope=analysis_scope)
     except RuntimeError as exc:
         if upload_path is not None:
             upload_path.unlink(missing_ok=True)
@@ -143,7 +146,7 @@ async def stream_session(session_id: str, request: Request) -> StreamingResponse
                     + f"Content-Length: {len(jpeg)}\r\n\r\n".encode()
                 )
                 yield header + jpeg + b"\r\n"
-            if runner.state not in ("starting", "running"):
+            if runner.state not in ("starting", "running", "stopping"):
                 break
             await asyncio.sleep(1 / 15)
 
@@ -161,7 +164,7 @@ async def session_events(websocket: WebSocket, session_id: str) -> None:
     try:
         while True:
             await websocket.send_json(runner.snapshot())
-            if runner.state not in ("starting", "running"):
+            if runner.state not in ("starting", "running", "stopping"):
                 break
             await asyncio.sleep(0.2)
     except WebSocketDisconnect:

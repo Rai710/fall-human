@@ -110,7 +110,7 @@ def test_upload_video_runs_people_pipeline_end_to_end(env):
     make_video(video)
     client = TestClient(main.app)
     with video.open("rb") as handle:
-        started = client.post("/api/sessions/start", data={"save_video": "false", "realtime": "false"},
+        started = client.post("/api/sessions/start", data={"save_video": "false", "realtime": "false", "analysis_scope": "person"},
                               files={"file": ("kamera-lorong.avi", handle, "video/x-msvideo")})
     assert started.status_code == 200, started.text
     snapshot = started.json()
@@ -148,7 +148,7 @@ def test_wrong_class_id_fails_with_clear_message(env, monkeypatch):
     make_video(video, seconds=3)
     client = TestClient(main.app)
     with video.open("rb") as handle:
-        snapshot = client.post("/api/sessions/start", data={"save_video": "false", "realtime": "false"},
+        snapshot = client.post("/api/sessions/start", data={"save_video": "false", "realtime": "false", "analysis_scope": "person"},
                                files={"file": ("a.avi", handle, "video/x-msvideo")}).json()
     done = wait_done(client, snapshot["id"])
     assert done["state"] == "failed"

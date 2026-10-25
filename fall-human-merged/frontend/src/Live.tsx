@@ -9,6 +9,7 @@ import {
   stopSession,
   streamUrl,
   type AlertRow,
+  type ActionModelInfo,
   type DetectorInfo,
   type LiveStats,
   type Snapshot,
@@ -21,7 +22,7 @@ type Props = {
 type Mode = 'camera' | 'file'
 
 function isActive(state?: string): boolean {
-  return state === 'starting' || state === 'running'
+  return state === 'starting' || state === 'running' || state === 'stopping'
 }
 
 function statusText(state?: string): string {
@@ -66,7 +67,7 @@ function formatConfidence(value?: string | number | null): string {
 
 const SOURCE_NAME: Record<DetectorInfo['source'], string> = {
   pretrained: 'pretrained',
-  local: 'best.pt lokal',
+  local: 'bobot lokal',
   huggingface: 'Hugging Face',
 }
 
@@ -97,11 +98,13 @@ function playAlarm(): void {
 }
 
 export default function Live({ onOpenHistory }: Props) {
-  const [mode, setMode] = useState<Mode>('camera')
+  const [mode, setMode] = useState<Mode>('file')
   const [cameraIndex, setCameraIndex] = useState('0')
   const [file, setFile] = useState<File | null>(null)
   const [saveVideo, setSaveVideo] = useState(true)
-  const [realtime, setRealtime] = useState(true)
+  const [realtime, setRealtime] = useState(false)
+  const [analysisScope, setAnalysisScope] = useState<"scene" | "person">("scene")
+  const [actionModel, setActionModel] = useState<ActionModelInfo | null>(null)
   const [detector, setDetector] = useState<DetectorInfo | null>(null)
   const [session, setSession] = useState<Snapshot | null>(null)
   const [stats, setStats] = useState<LiveStats>({})
@@ -135,7 +138,7 @@ export default function Live({ onOpenHistory }: Props) {
 
   useEffect(() => {
     getConfig()
-      .then((config) => setDetector(config.detector))
+      .then((config) => { setDetector(config.detector); setActionModel(config.action_model) })
       .catch(() => setDetector(null))
   }, [])
 
@@ -164,6 +167,7 @@ export default function Live({ onOpenHistory }: Props) {
     }
 
     const form = new FormData()
+    form.append("analysis_scope", analysisScope)
     if (mode === 'file' && file) {
       form.append('file', file)
       form.append('save_video', String(saveVideo))
@@ -240,7 +244,7 @@ export default function Live({ onOpenHistory }: Props) {
           <div>
             <h1>Live Monitoring</h1>
             <p className="muted">
-              Deteksi orang (YOLO + ByteTrack) lalu penilaian jatuh per orang dengan VideoMAE.
+              Analisis dugaan jatuh dengan VideoMAE. Pilih seluruh kamera atau per orang memakai YOLO + ByteTrack.
             </p>
             {detector && (
               <p className="muted">
@@ -315,6 +319,21 @@ export default function Live({ onOpenHistory }: Props) {
               </>
             )}
 
+            <label className="field">
+              Area analisis
+              <select value={analysisScope} onChange={(event) => setAnalysisScope(event.target.value as "scene" | "person")}>
+                <option value="scene">Seluruh kamera — sesuai training model</option>
+                <option value="person">Per orang — YOLO + ByteTrack (eksperimen)</option>
+              </select>
+              <small>{analysisScope === "person"
+                ? "Crop per orang mengubah input training; akurasinya perlu dievaluasi tersendiri."
+                : "Keputusan berlaku untuk adegan. Mode ini tidak menentukan orang mana yang jatuh."}</small>
+            </label>
+            <p className="muted">
+              Model: {actionModel?.label ?? "Le2i + CAUCAFall (2 kelas)"}
+              {actionModel?.threshold != null ? ` · ambang ${(actionModel.threshold * 100).toFixed(0)}%` : ""}
+              {actionModel && !actionModel.ready ? " · paket model belum lengkap" : ""}
+            </p>
             <button type="submit" className="primary" disabled={busy}>
               {busy ? 'Memulai...' : 'Mulai monitoring'}
             </button>
@@ -344,7 +363,7 @@ export default function Live({ onOpenHistory }: Props) {
                       ? 'Model sedang menganalisis...'
                       : stats.last_result_age_ms != null
                         ? `Hasil terakhir ${(stats.last_result_age_ms / 1000).toFixed(1)} detik lalu.`
-                        : 'Menunggu klip orang pertama...'
+                        : 'Menunggu klip pertama...'
                   }`}
             </p>
 
@@ -372,10 +391,11 @@ export default function Live({ onOpenHistory }: Props) {
                 <strong>{stats.frame ?? 0}</strong>
               </div>
               <div className="stat">
-                <span>Orang terlacak</span>
-                <strong>{stats.tracked_people ?? 0}</strong>
+                <span>Pelacakan orang</span>
+                <strong>{session.analysis_scope === 'scene' ? 'Tidak aktif' : stats.tracked_people ?? 0}</strong>
                 <small>
-                  {stats.detector_ms != null ? `deteksi ${stats.detector_ms.toFixed(0)} ms` : 'menunggu deteksi'}
+                  {session.analysis_scope === 'scene' ? 'Mode seluruh kamera' :
+                    stats.detector_ms != null ? `deteksi ${stats.detector_ms.toFixed(0)} ms` : 'menunggu deteksi'}
                 </small>
               </div>
               <div className="stat">
@@ -445,7 +465,7 @@ export default function Live({ onOpenHistory }: Props) {
                       <strong>{alert.label || 'Fall'}</strong>
                       {alert.track_id && (
                         <span className="muted">
-                          Orang ID {alert.track_id}.{alert.segment_id}
+                          {alert.evidence_scope === 'last_known_region' ? 'Area terakhir ID' : 'Orang ID'} {alert.track_id}.{alert.segment_id}
                         </span>
                       )}
                       <span className="muted">{formatClock(alert.timestamp_ms)}</span>
