@@ -8,11 +8,12 @@ Panduan fitur, instalasi, penempatan model dan batas penggunaan tersedia di
 
 | Nama | Fokus |
 |---|---|
-| **Raihan Buono** | VideoMAE, preprocessing, threshold, dan evaluasi model jatuh |
+| **Raihan Buono** | VideoMAE, preprocessing, threshold, evaluasi model jatuh, backend/API, dependensi dan format output |
 | **Michael** | YOLO detector orang, ByteTrack, dan evaluasi tracking |
 | **Rioo** | Frontend React, tampilan dashboard, dan interaksi pengguna |
 
-Integrasi backend/API, pengujian sistem, dan laporan dikerjakan bersama.
+Backend/API dan integrasi model ditangani oleh **Raihan Buono**. Pengujian sistem
+dan laporan dikerjakan bersama.
 
 Semua perintah di halaman ini dijalankan dari folder **`fall-human-merged`**.
 

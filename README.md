@@ -184,12 +184,12 @@ Batas yang masih perlu diperhatikan:
 
 | Nama | Tanggung jawab |
 |---|---|
-| **Raihan Buono** | Model deteksi jatuh VideoMAE: persiapan data Le2i + CAUCAFall, fine-tuning, preprocessing, threshold, dan evaluasi jatuh/nonjatuh |
+| **Raihan Buono** | Model deteksi jatuh VideoMAE: persiapan data Le2i + CAUCAFall, fine-tuning, preprocessing, threshold, evaluasi jatuh/nonjatuh, backend/API, dependensi dan format output |
 | **Michael** | Detector orang YOLO dan tracking ByteTrack: bobot detector, konfigurasi deteksi, kestabilan ID, dan evaluasi orang yang terlewat |
 | **Rioo** | Frontend React: tampilan dashboard, upload video, preview, tampilan alarm, riwayat, serta interaksi pengguna |
 
-Integrasi backend/API, pengujian sistem, dan penyusunan laporan dikerjakan
-bersama. Rincian koordinasi dan hasil kerja tiap bagian tersedia di
+Backend/API dan integrasi model ditangani oleh **Raihan Buono**. Pengujian sistem
+dan penyusunan laporan dikerjakan bersama. Rincian koordinasi tersedia di
 [PEMBAGIAN_TUGAS.md](PEMBAGIAN_TUGAS.md).
 
 ## Lisensi
