@@ -1,113 +1,127 @@
-# Deteksi orang jatuh — React + FastAPI + YOLO + VideoMAE
+# Panduan teknis aplikasi
 
-Dashboard ini menggabungkan **YoloDetector.pt** milik tim detector dengan
-**VideoMAE Le2i + CAUCAFall dua kelas** (`no_fall`, `fall`). Integrasi dikerjakan
-pada source `fall-human-merged` di checkout branch `final`.
+Panduan fitur, instalasi, penempatan model dan batas penggunaan tersedia di
+[README utama repository](../README.md). Rincian kerja tim tersedia di
+[PEMBAGIAN_TUGAS.md](../PEMBAGIAN_TUGAS.md).
 
-## Menjalankan di komputer ini
+## Tim dan pembagian tugas
 
-Klik **run_dashboard.cmd**, lalu buka **http://localhost:8000**.
-Launcher memakai `.venv-yolo` jika tersedia, atau interpreter lokal yang
-dikonfigurasi dalam `local_python.txt` (diabaikan Git). Build React disediakan
-di `frontend/dist`. Kamera belum dibuka saat dashboard baru diakses.
+| Nama | Fokus |
+|---|---|
+| **Raihan Buono** | VideoMAE, preprocessing, threshold, dan evaluasi model jatuh |
+| **Michael** | YOLO detector orang, ByteTrack, dan evaluasi tracking |
+| **Rioo** | Frontend React, tampilan dashboard, dan interaksi pengguna |
 
-Untuk instalasi mandiri pada komputer lain, jalankan `setup_dashboard.cmd`, lalu
-`run_dashboard.cmd`. Python 3.10–3.13 dan Node/npm diperlukan. Bobot model tidak
-ikut Git; salin kedua paket model secara terpisah.
+Integrasi backend/API, pengujian sistem, dan laporan dikerjakan bersama.
 
-## Dua mode analisis
+Semua perintah di halaman ini dijalankan dari folder **`fall-human-merged`**.
 
-1. **Seluruh kamera** (default): VideoMAE membaca adegan penuh dengan cara input
-   yang sesuai training. Mode ini tidak menjalankan YOLO/ByteTrack dan tidak
-   mengidentifikasi siapa yang jatuh.
-2. **Per orang** (eksperimen): YOLO → ByteTrack → klip RGB/crop per ID → VideoMAE.
-   Bobot classifier yang sama dipakai bergantian untuk klip setiap orang.
-   Crop mengubah input dari training seluruh adegan dan memerlukan evaluasi
-   akurasi tersendiri. Area terakhir saat track hilang diberi penanda khusus.
-
-Mulai dengan **Upload video**; simulasi live pada file mati secara default.
-Mode offline menunggu analisis klip sehingga waktu proses dapat melebihi durasi
-video. Webcam selalu mengikuti penjadwalan live, walaupun pilihan replay file
-tidak aktif. Webcam index menunjuk kamera mesin backend, bukan browser pengguna.
-
-## Bobot yang diperlukan
-
-```text
-models/
-├── YoloDetector.pt
-└── best_model-20261025T045257Z-1-001/
-    └── best_model/
-        ├── model.safetensors
-        ├── config.json
-        ├── preprocessor_config.json
-        ├── inference_config.json
-        ├── export_complete.json
-        └── ... seluruh berkas ekspor lainnya
-```
-
-YOLO bertipe `detect`, kelas **0 = person**. `model_config.json` menunjuk
-`models/YoloDetector.pt`; opsi lokal/pretrained/Hugging Face tetap tersedia.
-
-Classifier memakai epoch 4 (`mixed_fine_tuning`), input 16 gambar RGB sekitar
-2 detik, letterbox hitam PIL bilinear 224×224, normalisasi processor tersimpan,
-stride 0,5 detik dan satu konfirmasi awal. Threshold ekspor tetap **0,58**;
-ambang alarm aplikasi dinaikkan menjadi **0,70 (70%)** di `action_config.py`. Dua hasil
-di bawah ambang memulihkan gate untuk kejadian berikutnya. Label positif mencakup
-gerakan jatuh atau keadaan setelah jatuh. Skor belum terkalibrasi sebagai peluang.
-
-Dashboard memakai paket lokal secara eksplisit. Tidak ada unduhan atau fallback
-otomatis ke model HF tujuh kelas ketika classifier ini tidak lengkap. Loader
-memeriksa hash ekspor; pertahankan seluruh isi `best_model` tanpa mengubahnya.
-
-## Bagian aplikasi
-
-- `frontend/`: React/TypeScript/Vite; upload, progres, alarm, review, dan riwayat.
-- `backend/`: FastAPI; sesi, preview MJPEG, event WebSocket, laporan dan video.
-- `action_config.py`: lokasi/metadata classifier dua kelas.
-- `mixed_model_config.py`: validasi ekspor dan preprocessing sesuai training.
-- `pose_engine.py`: loader classifier dan analisis seluruh kamera.
-- `person_engine.py`: YOLO/ByteTrack, crop per orang, dan pengelolaan track hilang.
-- `live_core.py`, `person_core.py`: buffer, antrean, dan gate alarm.
-
-API `POST /api/sessions/start` menerima file atau index webcam, `save_video`,
-`realtime` (file default false), dan `analysis_scope` (`scene` atau `person`,
-default `scene`). `GET /api/config` menjelaskan detector dan classifier aktif.
-Satu sesi aktif diizinkan per proses backend; permintaan lain ditolak HTTP 409,
-bukan dimasukkan ke antrean pengguna. Jangan jalankan beberapa worker Uvicorn
-untuk berbagi model/session state pada implementasi ini.
-
-Output di `outputs/<sesi>/`: video H.264 bila konversi berhasil, prediksi/alarm
-CSV, summary JSON, preview, dan review. Riwayat lama tetap bisa dibaca.
-
-## Pengembangan dan pengujian
-
-Backend: `python -m uvicorn backend.main:app --port 8000`.
-Frontend: `npm --prefix frontend ci`, lalu `npm --prefix frontend run dev`.
-Frontend dev mem-proxy `/api` dan WebSocket ke port 8000. Build: `npm --prefix frontend run build`.
-
-Tes otomatis: `python -m pytest -q`. Tes API/engine memakai model palsu;
-tes tersebut tidak mengukur akurasi. Uji kedua model asli lewat API:
+## Menjalankan di Windows
 
 ```powershell
-python tests/smoke_real_models.py "D:\video\contoh.mp4"
+.\setup_dashboard.cmd
+.\run_dashboard.cmd
 ```
 
-Lihat **INTEGRASI_MODEL.md** untuk perbandingan sebelum/sesudah dan hasil uji aktual.
-`README_ENGINE.md` dan `VERIFIKASI.md` adalah dokumentasi engine versi sebelumnya.
-Aplikasi desktop `MULAI.cmd` tetap merupakan entry point lama; gunakan dashboard
-untuk konfigurasi gabungan terbaru ini.
+Setup pertama membuat `.venv-yolo` dan memasang paket. Launcher membangun React
+jika hasil build belum ada, lalu menyajikan frontend dan backend pada
+**http://localhost:8000**. Bila sudah memiliki runtime lokal yang cocok, launcher
+dapat membacanya dari `local_python.txt`; file ini tidak ikut Git.
 
-## Batas integrasi
+Dashboard memakai paket VideoMAE lokal. Jika pesan akhir script setup lama
+menyebut unduhan model otomatis, yang berlaku untuk dashboard gabungan adalah
+konfigurasi lokal di `action_config.py`; paket model tetap harus disiapkan.
 
-Model terbaru pernah salah menandai orang rebah di kasur sebagai fall. Integrasi
-tidak memperbaiki akurasi bobot atau membuktikan performa CCTV multi-orang.
-Stride 0,5 detik tidak menjamin inferensi selesai setiap 0,5 detik. CPU dapat
-tertinggal pada mode live; crop per orang perlu dievaluasi secara terpisah.
+## Mode pengembangan
 
-Source ini disiapkan untuk lokal/satu origin. Deployment frontend dan backend
-terpisah masih memerlukan konfigurasi URL API/WebSocket, CORS, kontrol akses,
-dan penyimpanan hasil yang sesuai. Belum ada deployment cloud dalam pekerjaan ini.
+Terminal backend:
 
-Checkpoint asal VideoMAE mencantumkan CC BY-NC 4.0; Ultralytics memakai AGPL-3.0
-atau lisensi komersial yang sesuai. Ketentuan bobot YOLO custom perlu mengikuti
-asal training dan izin tim pembuatnya.
+```powershell
+.\.venv-yolo\Scripts\python.exe -m uvicorn backend.main:app --port 8000
+```
+
+Terminal frontend:
+
+```powershell
+npm --prefix frontend ci
+npm --prefix frontend run dev
+```
+
+Buka alamat yang dicetak Vite. Konfigurasi dev mem-proxy `/api` dan WebSocket ke
+port 8000. Untuk membuat build baru:
+
+```powershell
+npm --prefix frontend run build
+```
+
+Jika memakai `local_python.txt`, ganti path interpreter pada perintah Python
+dengan interpreter yang tercatat di file tersebut.
+
+## Konfigurasi model
+
+| File | Peran |
+|---|---|
+| `model_config.json` | Sumber bobot YOLO, `person_class_ids`, confidence detector |
+| `tracker.yaml` | Ambang tracking dan pembuatan ID ByteTrack |
+| `person_core.py` | Default ukuran input YOLO 416, target deteksi 10 FPS, batas analisis 6 orang |
+| `action_config.py` | Lokasi classifier dan **ambang aplikasi 70%** |
+| `mixed_model_config.py` | Pemeriksaan paket ekspor dan letterbox hitam sesuai training |
+| `models/.../best_model/inference_config.json` | Profil ekspor: 16 frame/2 detik, stride 0,5 detik, threshold validation 58% |
+
+Threshold aplikasi adalah override yang terpisah dari threshold ekspor. Jangan
+mengedit paket ekspor untuk mengubah ambang aplikasi: hash-nya diperiksa loader.
+Kelas `0 = person` sudah diperiksa pada `YoloDetector.pt` yang dipakai saat integrasi.
+
+## API yang tersedia
+
+| Endpoint | Fungsi |
+|---|---|
+| `GET /api/health` | Memeriksa apakah backend aktif |
+| `GET /api/config` | Metadata detector dan classifier; termasuk threshold aplikasi/ekspor |
+| `POST /api/sessions/start` | Memulai analisis file atau webcam |
+| `POST /api/sessions/{id}/stop` | Meminta sesi berhenti |
+| `GET /api/sessions/{id}/stream` | Preview MJPEG |
+| `WS /api/sessions/{id}/events` | Status sesi, statistik dan alarm |
+| `GET /api/sessions` | Daftar riwayat sesi tersimpan |
+| `GET /api/sessions/{id}` | Detail sesi aktif atau riwayat |
+| `POST /api/sessions/{id}/review` | Menyimpan tinjauan alarm |
+| `GET /api/sessions/{id}/files/{filename}` | Mengambil berkas hasil yang diizinkan |
+| `GET /api/sessions/{id}/download` | Mengunduh ZIP hasil |
+
+Form awal menerima `file` atau `camera_index`, `save_video`, `realtime`, dan
+`analysis_scope`. Nilai scope adalah `scene` (default) atau `person`. Replay
+file default offline; webcam selalu live. ID sesi aktif dan nama folder hasil
+berbeda; gunakan field `output` untuk membuka riwayat/berkas hasil setelah selesai.
+
+Satu sesi aktif diizinkan per proses; sesi tambahan mendapat HTTP 409. State
+sesi/model berada dalam memori. Jalankan satu worker Uvicorn untuk versi ini.
+
+## Output dan pengujian
+
+Hasil disimpan pada `outputs/<sesi>/`: CSV prediksi/alarm, JSON ringkasan, preview,
+video anotasi bila diminta, dan tinjauan. Tidak semua jenis keluaran tersedia
+pada setiap mode; webcam tidak direkam oleh opsi penyimpanan video file.
+
+```powershell
+.\.venv-yolo\Scripts\python.exe -m pytest -q
+.\.venv-yolo\Scripts\python.exe tests\smoke_real_models.py "D:\video\contoh.mp4"
+```
+
+Tes otomatis memakai model palsu untuk sebagian besar kontrak API/engine. Script
+smoke memakai bobot asli dan membutuhkan video lokal serta paket model lengkap.
+Ia menghasilkan `outputs/integration_real_smoke.json`; ini pemeriksaan fungsi,
+bukan evaluasi akurasi. Rincian pengujian terdahulu berada di
+[INTEGRASI_MODEL.md](INTEGRASI_MODEL.md).
+
+## Masalah yang sudah diketahui
+
+- Preview offline berhenti sejenak saat menunggu klip dianalisis di CPU.
+- Ukuran YOLO aplikasi 416 berbeda dari training 640; evaluasi sebelum mengubah default.
+- Pergantian ID bisa menghasilkan beberapa alarm untuk kejadian yang sama.
+- Track hilang memakai area terakhir yang ditandai khusus, bukan posisi orang terkonfirmasi.
+- Error timestamp webcam pernah dilaporkan; belum ada perubahan kode untuk masalah ini.
+- Video hasil hanya bisa diputar jika memang disimpan dan codec didukung browser.
+- Kode masih memakai satu origin; pemisahan hosting memerlukan URL API/WS dan CORS yang sesuai.
+
+`README_ENGINE.md`, `VERIFIKASI.md` dan `MULAI.cmd` merujuk engine/entry point
+desktop sebelumnya. Gunakan `run_dashboard.cmd` untuk aplikasi web gabungan.
