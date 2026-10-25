@@ -24,8 +24,9 @@ detector, dan checkpoint VideoMAE dua kelas terbaru. Folder hasil:
 
 `D:\Codinganku\web-fall-human\fall-human\fall-human-merged`
 
-Repo Git berada satu tingkat di atas folder tersebut. Pekerjaan ini mengubah
-checkout lokal; belum membuat commit, push, PR, atau deployment cloud.
+Repo Git berada satu tingkat di atas folder tersebut. Source versi final telah
+dikirim ke `main` pada `Rai710/fall-human`, merge commit `f5c00d3`, dengan
+riwayat main lama dipertahankan. Deployment cloud belum dilakukan.
 
 ## Model yang benar-benar dipakai
 
@@ -153,8 +154,8 @@ Untuk komputer lain, buat environment mandiri lewat `setup_dashboard.cmd`.
 File `local_python.txt` dan bobot tidak ikut Git.
 
 Backup berkas tujuan sebelum pemasangan disimpan dalam `.cache/integration_backup_*/`.
-Tidak ada penghapusan source/model lama. Source untuk Git berupa perubahan lokal
-di branch `final`; bobot, hasil, build, dan konfigurasi interpreter tetap diabaikan Git.
+Tidak ada penghapusan source/model lama. Source integrasi telah dibagikan ke
+`main`; bobot, hasil, build, dan konfigurasi interpreter tetap diabaikan Git.
 
 ## Batas yang masih ada
 
