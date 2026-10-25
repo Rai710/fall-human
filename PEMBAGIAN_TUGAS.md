@@ -1,21 +1,22 @@
 # Pembagian tugas tim
 
 Tim terdiri dari **Raihan Buono**, **Michael**, dan **Rioo**. Tabel berikut
-menetapkan tanggung jawab utama tiap anggota; integrasi backend/API, pengujian
-sistem, serta penyusunan laporan dikerjakan bersama.
+menetapkan tanggung jawab utama tiap anggota. Backend/API dan integrasi model
+menjadi tanggung jawab Raihan Buono; pengujian sistem dan laporan dikerjakan bersama.
 
 ## Penanggung jawab utama
 
 | Anggota | Fokus | Hasil yang diserahkan |
 |---|---|---|
-| **Raihan Buono — model jatuh** | Dataset/label Le2i + CAUCAFall, fine-tuning VideoMAE, preprocessing, threshold, evaluasi jatuh | Paket ekspor lengkap, pemetaan label, panduan input, laporan metrik dan contoh kesalahan |
+| **Raihan Buono — model jatuh dan backend** | Dataset/label Le2i + CAUCAFall, fine-tuning VideoMAE, preprocessing, threshold, evaluasi jatuh, backend/API, dependensi dan format output | Paket ekspor lengkap, fungsi inferensi dan backend/API, panduan input/output, laporan metrik dan contoh kesalahan |
 | **Michael — deteksi dan tracking** | Dataset YOLO, `YoloDetector.pt`, pengujian orang kecil/tertutup, ByteTrack dan kestabilan ID | Bobot + daftar kelas, konfigurasi detector/tracker, perbandingan input 416/640, laporan orang terlewat dan ID berganti |
 | **Rioo — frontend** | React, tampilan upload, progres, preview, alarm, riwayat, review dan unduh hasil | Antarmuka dashboard, integrasi panggilan API dari frontend, dan skenario uji antarmuka |
 
 PIC berarti penjaga perubahan modul, bukan satu-satunya orang yang mengerjakannya.
 Raihan Buono dan Michael menyediakan serta menguji fungsi inferensi modul
 masing-masing. Rioo mengerjakan antarmuka dan pemanggilan API dari frontend.
-Penyambungan fungsi ke backend/API serta masalah integrasi ditangani bersama.
+Raihan Buono menangani penyambungan fungsi ke backend/API, dependensi, dan format
+output. Pengujian integrasi dan review hasil tetap melibatkan anggota lain.
 
 ## Kepemilikan modul untuk mengurangi konflik
 
@@ -24,11 +25,11 @@ Penyambungan fungsi ke backend/API serta masalah integrasi ditangani bersama.
 | `pose_engine.py`, `mixed_model_config.py`, `action_config.py` | Raihan Buono | Rioo untuk kontrak; Michael untuk input per orang |
 | `detector_config.py`, `person_engine.py`, `person_core.py`, `tracker.yaml` | Michael | Raihan Buono untuk crop dan jendela waktu |
 | `frontend/` | Rioo | Raihan Buono dan Michael untuk makna hasil yang ditampilkan |
-| `backend/`, `live_core.py`, dependensi dan format output | Bersama; pilih satu PIC per perubahan | Minimal satu anggota lain |
+| `backend/`, `live_core.py`, dependensi dan format output | **Raihan Buono** | Minimal satu anggota lain |
 | Skenario demo, evaluasi gabungan, README dan laporan akhir | Semua anggota | Saling memeriksa hasil dan klaim |
 
-Satu orang menjadi PIC integrasi untuk setiap rilis/demo. Tugasnya menggabungkan
-perubahan dan mencatat hasil uji, bukan mengambil semua pekerjaan backend.
+Raihan Buono menjadi PIC backend dan integrasi model. Penetapan versi demo,
+pengujian akhir, dan review laporan tetap dikoordinasikan bersama tim.
 
 ## Kontrak yang perlu disepakati
 
@@ -48,7 +49,7 @@ yang diganti harus membawa konfigurasi label dan preprocessing yang cocok.
 | 1 | Tetapkan satu versi source dan paket model untuk demo | Bersama | Versi/commit, bobot, threshold, mode, dan perangkat dicatat |
 | 2 | Evaluasi jatuh vs aktivitas normal pada video yang sama | Raihan Buono | Prediksi/alarm benar dan salah dicatat; bukan hanya memilih contoh berhasil |
 | 3 | Bandingkan YOLO input 416 dan 640 pada contoh yang sulit | Michael | Orang terlewat, kotak salah, ID berganti, dan waktu proses dibandingkan |
-| 4 | Pastikan upload → proses → riwayat → unduh berjalan | Rioo, dibantu tim untuk backend | Skenario berhasil/gagal dapat diulang tanpa memakai model palsu saja |
+| 4 | Pastikan upload → proses → riwayat → unduh berjalan | Rioo, dibantu Raihan Buono untuk backend | Skenario berhasil/gagal dapat diulang tanpa memakai model palsu saja |
 | 5 | Susun hasil dan batas sistem | Semua | Tiap anggota menulis bagian modulnya; istilah dan angka konsisten |
 
 Untuk tahap laporan, pertahankan arsitektur yang sudah ada. Optimasi GPU,
